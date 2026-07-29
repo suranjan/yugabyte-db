@@ -1700,9 +1700,19 @@ WalSndWriteData(LogicalDecodingContext *ctx, XLogRecPtr lsn, TransactionId xid,
 	 * Fill the send timestamp last, so that it is taken as late as possible.
 	 * This is somewhat ugly, but the protocol is set as it's already used for
 	 * several releases by streaming physical replication.
+	 *
+	 * YB: When HT-based replication is enabled, send the VWAL safe_time
+	 * instead of the wall-clock timestamp so the subscriber can track
+	 * replication progress via Hybrid Time.
 	 */
 	resetStringInfo(&tmpbuf);
-	now = GetCurrentTimestamp();
+	{
+		uint64 safe_time = IsYugaByteEnabled() ? YBCGetVirtualWalSafeTime() : 0;
+		if (safe_time > 0)
+			now = (TimestampTz) safe_time;
+		else
+			now = GetCurrentTimestamp();
+	}							/* YB */
 	pq_sendint64(&tmpbuf, now);
 	memcpy(&ctx->out->data[1 + sizeof(int64) + sizeof(int64)],
 		   tmpbuf.data, sizeof(int64));
@@ -3439,6 +3449,13 @@ XLogSendLogical(void)
 				WalSndShutdown();
 		}
 	}
+	/*
+	 * YB: Do not send keepalives here when the VWAL yields no rows; match
+	 * upstream behavior where WalSndLoop invokes WalSndKeepaliveIfNecessary()
+	 * based on wal_sender_timeout (half-interval heartbeat).  WalSndKeepalive
+	 * still carries VWAL safe_time in the send_time field when available so
+	 * subscribers advance hybrid-time progress on that schedule.
+	 */
 
 	/*
 	 * If first time through in this session, initialize flushPtr.  Otherwise,
@@ -4077,7 +4094,25 @@ WalSndKeepalive(bool requestReply, XLogRecPtr writePtr)
 	resetStringInfo(&output_message);
 	pq_sendbyte(&output_message, 'k');
 	pq_sendint64(&output_message, yb_keepalive_ptr);
-	pq_sendint64(&output_message, GetCurrentTimestamp());
+
+	/*
+	 * YB: When HT-based replication is enabled, repurpose the keepalive
+	 * send_time field to carry the VWAL's safe_time (Hybrid Time).  The
+	 * subscriber's apply worker uses this to advance yb_last_commit_ht
+	 * even when no DML records are flowing, which is critical for the
+	 * SYNCDONE->READY state transition.
+	 */
+	{
+		uint64 safe_time = IsYugaByteEnabled() ? YBCGetVirtualWalSafeTime() : 0;
+		if (safe_time > 0)
+		{
+			pq_sendint64(&output_message, (int64) safe_time);
+			YBCSetLastKeepaliveSafeTimeSent(safe_time);
+		}
+		else
+			pq_sendint64(&output_message, GetCurrentTimestamp());
+	}							/* YB */
+
 	pq_sendbyte(&output_message, requestReply ? 1 : 0);
 
 	/* ... and send it wrapped in CopyData */
@@ -4104,6 +4139,18 @@ WalSndKeepaliveIfNecessary(void)
 		return;
 
 	if (waiting_for_ping_response)
+		return;
+
+	/*
+	 * YB: For logical replication, only consider timeout-driven keepalive
+	 * once the latest VWAL fetch completed a full poll round and still had no
+	 * records to stream. This avoids using timeout heartbeat while a partial
+	 * poll round may still have streamable records pending.
+	 */
+	if (IsYugaByteEnabled() &&
+		MyReplicationSlot &&
+		SlotIsLogical(MyReplicationSlot) &&
+		!YBCPollRoundCompleteWithNoRecords())
 		return;
 
 	/*

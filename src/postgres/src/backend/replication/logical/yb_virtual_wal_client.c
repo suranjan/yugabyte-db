@@ -50,10 +50,30 @@ static MemoryContext aborted_subtxn_sets_context = NULL;
 static YbcPgChangeRecordBatch *cached_records = NULL;
 static size_t cached_records_last_sent_row_idx = 0;
 static bool last_getconsistentchanges_response_empty = false;
+static bool last_getconsistentchanges_poll_round_complete = false;
 static TimestampTz last_getconsistentchanges_response_receipt_time;
 static XLogRecPtr last_txn_begin_lsn = InvalidXLogRecPtr;
 /* Commit LSN of the latest transaction filtered by the decoder. */
 static XLogRecPtr last_filtered_commit_lsn = InvalidXLogRecPtr;
+
+static uint64 last_keepalive_safe_time_sent = 0;
+
+/*
+ * Latest safe_time (Hybrid Time) from the VWAL. This advances monotonically
+ * even when there are no DML records. The walsender uses this in keepalive
+ * messages so the subscriber can track replication progress.
+ */
+static uint64 yb_vwal_safe_time = 0;
+
+/*
+ * Commit time of the latest record handed to decoding: the hybrid-time
+ * counterpart of the walsender's sentPtr, which advances only once a record
+ * has been processed.
+ */
+static uint64 yb_last_decoded_commit_ht = 0;
+
+/* High-water mark of YBCGetVirtualWalSafeTime(), so it never goes backwards. */
+static uint64 yb_reported_safe_time = 0;
 
 /*
  * Aborted subtransaction sets (YbcPgAbortedSubtxnSet) of the DocDB
@@ -269,9 +289,13 @@ YBCInitVirtualWal(List *yb_publication_names)
 
 	unacked_transactions = NIL;
 	last_getconsistentchanges_response_empty = false;
+	last_getconsistentchanges_poll_round_complete = false;
 	last_getconsistentchanges_response_receipt_time = 0;
 	last_txn_begin_lsn = InvalidXLogRecPtr;
 	last_filtered_commit_lsn = InvalidXLogRecPtr;
+	last_keepalive_safe_time_sent = 0;
+	yb_last_decoded_commit_ht = 0;
+	yb_reported_safe_time = 0;
 
 	needs_publication_table_list_refresh = false;
 	explicit_alter_publication_detected = false;
@@ -721,6 +745,14 @@ YBCReadRecord(List *publication_names)
 								   &cached_records);
 		AddAbortedSubtxnSets(cached_records);
 
+		if (cached_records && cached_records->safe_time > yb_vwal_safe_time)
+			yb_vwal_safe_time = cached_records->safe_time;
+		if (cached_records)
+			last_getconsistentchanges_poll_round_complete =
+				cached_records->poll_round_complete;
+		else
+			last_getconsistentchanges_poll_round_complete = false;
+
 		cached_records_last_sent_row_idx = 0;
 		YbWalSndTotalTimeInYBDecodeMicros = 0;
 		YbWalSndTotalTimeInReorderBufferMicros = 0;
@@ -769,6 +801,28 @@ YBCReadRecord(List *publication_names)
 	publication_refresh_record.xid = record->xid;
 
 	MemoryContextSwitchTo(caller_context);
+
+	/*
+	 * Keepalive safe_time must be strictly less than the commit_time_ht of any
+	 * record streamed afterwards.
+	 */
+	if (last_keepalive_safe_time_sent > 0 &&
+		record &&
+		record->commit_time_ht <= last_keepalive_safe_time_sent)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("record commit time is not greater than last keepalive safe time"),
+				 errdetail("Record commit_time_ht=%" PRIu64
+						   ", last_keepalive_safe_time_sent=%" PRIu64
+						   ", action=%d, xid=%u, lsn=%" PRIu64,
+						   record->commit_time_ht,
+						   last_keepalive_safe_time_sent,
+						   record->action,
+						   record->xid,
+						   record->lsn)));
+
+	if (record && record->commit_time_ht > yb_last_decoded_commit_ht)
+		yb_last_decoded_commit_ht = record->commit_time_ht;
 
 	/* record should be non-null, but be conservative and check. */
 	if (record)
@@ -1325,4 +1379,42 @@ ValidateReplicaIdentities(Oid *table_oids, int num_tables)
 							"plugin pgoutput", table_oids[i]),
 					 errhint("Consider using output plugin yboutput instead. ")));
 	}
+}
+
+/*
+ * The hybrid time a keepalive reports: every transaction committed at or
+ * before it has been sent.  The VWAL's safe time is exclusive (records at it
+ * may still follow) and a batch raises it before any of its rows are sent, so
+ * use it only once the batch is drained; otherwise use the commit time of the
+ * last decoded record, as upstream reports sentPtr.  Either is exclusive, so
+ * subtract 1, as WalSndKeepalive does to sentPtr on HYBRID_TIME slots.
+ */
+uint64
+YBCGetVirtualWalSafeTime(void)
+{
+	uint64		exclusive = yb_last_decoded_commit_ht;
+	bool		drained = cached_records == NULL ||
+		cached_records_last_sent_row_idx >= cached_records->row_count;
+
+	if (drained && last_getconsistentchanges_poll_round_complete &&
+		yb_vwal_safe_time > exclusive)
+		exclusive = yb_vwal_safe_time;
+
+	if (exclusive > 0 && exclusive - 1 > yb_reported_safe_time)
+		yb_reported_safe_time = exclusive - 1;
+	return yb_reported_safe_time;
+}
+
+bool
+YBCPollRoundCompleteWithNoRecords(void)
+{
+	return last_getconsistentchanges_response_empty &&
+		   last_getconsistentchanges_poll_round_complete;
+}
+
+void
+YBCSetLastKeepaliveSafeTimeSent(uint64 safe_time)
+{
+	if (safe_time > last_keepalive_safe_time_sent)
+		last_keepalive_safe_time_sent = safe_time;
 }

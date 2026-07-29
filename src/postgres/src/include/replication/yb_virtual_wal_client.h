@@ -47,6 +47,9 @@ extern XLogRecPtr YBCGetFlushRecPtr(void);
 extern XLogRecPtr YBCCalculatePersistAndGetRestartLSN(XLogRecPtr confirmed_flush);
 
 extern void YBCTrackFilteredTransaction(XLogRecPtr commit_lsn);
+extern uint64 YBCGetVirtualWalSafeTime(void);
+extern bool YBCPollRoundCompleteWithNoRecords(void);
+extern void YBCSetLastKeepaliveSafeTimeSent(uint64 safe_time);
 
 extern const uint32_t *YBCGetAbortedSubtxnSet(const char *docdb_txn_id,
 											  int *size);

@@ -358,7 +358,7 @@ Status CDCSDKVirtualWAL::InitVirtualWALInternal(
   if (!s.ok()) {
     s = s.CloneAndPrepend(Format(
           "Init LSN & TxnID generators failed for stream_id: $0", stream_id_));
-    LOG_WITH_PREFIX(DFATAL) << s;
+    LOG_WITH_PREFIX(WARNING) << s;
     return s;
   }
 
@@ -770,6 +770,10 @@ Status CDCSDKVirtualWAL::GetConsistentChangesInternal(
   // all the empty tablet queues. So once there is no tablet in 'empty_tablet_queues', we can add
   // the records from tablet_queues_ to the priority queue.
   if (empty_tablet_queues.empty()) {
+    if (!first_full_poll_round_completed_) {
+      first_full_poll_round_completed_ = true;
+      LOG_WITH_PREFIX(INFO) << "First full poll round completed across all tablet queues";
+    }
     for (const auto& entry : tablet_queues_) {
       auto s = AddRecordToVirtualWalPriorityQueue(entry.first, &sorted_records);
       if (!s.ok()) {
@@ -1044,6 +1048,12 @@ Status CDCSDKVirtualWAL::GetConsistentChangesInternal(
     LOG_WITH_PREFIX(WARNING) << "Could not update restart time for stream id: " << stream_id_
                  << ", because: " << s.ToString();
   }
+
+  if (virtual_wal_safe_time_.is_valid()) {
+    resp->set_safe_time(virtual_wal_safe_time_.ToUint64());
+  }
+  resp->set_poll_round_complete(first_full_poll_round_completed_);
+
   std::ostringstream oss;
   if (resp->cdc_sdk_proto_records_size() == 0) {
     oss.clear();

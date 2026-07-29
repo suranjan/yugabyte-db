@@ -112,6 +112,11 @@ DEFINE_RUNTIME_PG_FLAG(bool, yb_user_ddls_preempt_auto_analyze, true,
 
 DECLARE_bool(TEST_ash_debug_aux);
 
+DEFINE_RUNTIME_bool(ysql_yb_use_commit_time_ht_in_replication, false,
+    "When true, the commit_time field in logical replication protocol messages carries "
+    "the raw hybrid time instead of the PG-epoch-converted timestamp. This enables "
+    "hybrid-time-based synchronization for YB-to-YB logical replication.");
+
 /* Constants for replication slot LSN types */
 const std::string YBC_LSN_TYPE_SEQUENCE = "SEQUENCE";
 const std::string YBC_LSN_TYPE_HYBRID_TIME = "HYBRID_TIME";
@@ -3211,9 +3216,10 @@ YbcStatus YBCPgGetCDCConsistentChanges(
     new (&resp_rows[row_idx]) YbcPgRowMessage{
         .col_count = col_count,
         .cols = cols,
-        // Convert the physical component of the HT to PG epoch.
-        .commit_time = static_cast<uint64_t>(
-            YBCGetPgCallbacks()->UnixEpochToPostgresEpoch(commit_time_ht.GetPhysicalValueMicros())),
+        .commit_time = FLAGS_ysql_yb_use_commit_time_ht_in_replication
+            ? commit_time_ht.ToUint64()
+            : static_cast<uint64_t>(YBCGetPgCallbacks()->UnixEpochToPostgresEpoch(
+                  commit_time_ht.GetPhysicalValueMicros())),
         .commit_time_ht = commit_time_ht.ToUint64(),
         .record_time_ht =
             row_message_pb.has_record_time() ? row_message_pb.record_time() : 0,
@@ -3251,6 +3257,9 @@ YbcStatus YBCPgGetCDCConsistentChanges(
       .aborted_subtxn_sets = nullptr,
       .aborted_subtxn_sets_count = 0,
       .response = nullptr,
+      .safe_time = resp->has_safe_time() ? resp->safe_time() : 0,
+      .poll_round_complete =
+          resp->has_poll_round_complete() ? resp->poll_round_complete() : false,
   };
   if (!publication_refresh_txn_id.empty()) {
     snprintf(

@@ -240,6 +240,17 @@ message GetConsistentChangesResponsePB {
   // Aborted subtransactions of the transactions whose BEGIN records the virtual WAL read for this
   // response, keyed by DocDB transaction id.
   map<string, CDCSDKAbortedSubtxnsPB> aborted_subtxns = 8;
+
+  // The VWAL's current safe time (Hybrid Time). This advances monotonically
+  // even when there are no DML records, allowing the subscriber to track
+  // replication progress for state machine transitions.
+  optional uint64 safe_time = 9;
+
+  // True once the VWAL has completed at least one full poll round across all
+  // tablet queues (i.e. every tablet has been polled at least once). Remains
+  // true thereafter. Used by the walsender to gate keepalive messages: safe_time
+  // is considered reliable for keepalives only after this flag becomes true.
+  optional bool poll_round_complete = 10;
 }
 
 message CDCSDKAbortedSubtxnsPB {

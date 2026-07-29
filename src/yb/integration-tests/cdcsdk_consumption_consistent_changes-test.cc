@@ -110,6 +110,82 @@ TEST_F(CDCSDKConsumptionConsistentChangesTest, TestVirtualWAL) {
   ASSERT_NOK(GetConsistentChangesFromCDC(stream_id, kVWALSessionId3));
 }
 
+TEST_F(CDCSDKConsumptionConsistentChangesTest, TestGetConsistentChangesIncludesSafeTime) {
+  ASSERT_OK(SetUpWithParams(3, 1, false, true));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, test_namespace_name, kTableName, 3));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 3);
+  auto stream_id = ASSERT_RESULT(CreateConsistentSnapshotStreamWithReplicationSlot());
+
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(test_namespace_name));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO test_table ($0, $1) SELECT i, i+1 FROM generate_series(1, 10) AS i",
+      kKeyColumnName, kValueColumnName));
+  ASSERT_OK(InitVirtualWAL(stream_id, {table.table_id()}, kVWALSessionId1));
+
+  auto resp = ASSERT_RESULT(GetConsistentChangesFromCDC(stream_id, kVWALSessionId1));
+  ASSERT_TRUE(resp.has_safe_time())
+      << "GetConsistentChanges should populate safe_time (hybrid time) for the VWAL";
+  ASSERT_GT(resp.safe_time(), 0);
+
+  const uint64_t first_safe_time = resp.safe_time();
+  resp = ASSERT_RESULT(GetConsistentChangesFromCDC(stream_id, kVWALSessionId1));
+  ASSERT_TRUE(resp.has_safe_time());
+  ASSERT_GE(resp.safe_time(), first_safe_time)
+      << "VWAL safe_time exposed to subscribers must not move backwards";
+}
+
+TEST_F(CDCSDKConsumptionConsistentChangesTest, TestGetConsistentChangesPollRoundCompleteSignal) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdcsdk_vwal_tablets_to_poll_batch_size) = 1;
+  ASSERT_OK(SetUpWithParams(3, 1, false, true));
+  auto table = ASSERT_RESULT(CreateTable(&test_cluster_, test_namespace_name, kTableName, 3));
+  google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
+  ASSERT_OK(test_client()->GetTablets(table, 0, &tablets, nullptr));
+  ASSERT_EQ(tablets.size(), 3);
+  auto stream_id = ASSERT_RESULT(CreateConsistentSnapshotStreamWithReplicationSlot());
+
+  auto conn = ASSERT_RESULT(test_cluster_.ConnectToDB(test_namespace_name));
+  ASSERT_OK(conn.ExecuteFormat(
+      "INSERT INTO test_table ($0, $1) SELECT i, i+1 FROM generate_series(1, 20) AS i",
+      kKeyColumnName, kValueColumnName));
+  ASSERT_OK(InitVirtualWAL(stream_id, {table.table_id()}, kVWALSessionId1));
+
+  // With batch_size=1 and 3 tablets, the first response should be a partial
+  // poll round (only 1 tablet polled out of 3).
+  auto resp = ASSERT_RESULT(GetConsistentChangesFromCDC(stream_id, kVWALSessionId1));
+  ASSERT_TRUE(resp.has_poll_round_complete());
+  ASSERT_FALSE(resp.poll_round_complete())
+      << "With tablets_to_poll_batch_size=1 and 3 tablets, first response should be a partial poll "
+         "round";
+
+  // poll_round_complete stays false until all tablets have been polled at least
+  // once (the first full poll round). With batch_size=1 and 3 tablets this takes
+  // multiple calls. Once it flips to true, it must remain true permanently.
+  bool saw_poll_round_complete = false;
+  bool saw_records = false;
+  for (int i = 0; i < 100; ++i) {
+    resp = ASSERT_RESULT(GetConsistentChangesFromCDC(stream_id, kVWALSessionId1));
+    ASSERT_TRUE(resp.has_poll_round_complete());
+    if (resp.cdc_sdk_proto_records_size() > 0) {
+      saw_records = true;
+    }
+    if (resp.poll_round_complete()) {
+      saw_poll_round_complete = true;
+    }
+    if (saw_poll_round_complete) {
+      ASSERT_TRUE(resp.poll_round_complete())
+          << "poll_round_complete must remain true once the first full poll round completes";
+    }
+    if (saw_records && saw_poll_round_complete && resp.cdc_sdk_proto_records_size() == 0) {
+      break;
+    }
+  }
+  ASSERT_TRUE(saw_records) << "Expected to receive records from the inserts";
+  ASSERT_TRUE(saw_poll_round_complete)
+      << "Expected poll_round_complete=true after all tablets have been polled at least once";
+}
+
 TEST_F(CDCSDKConsumptionConsistentChangesTest, TestExplicitCheckpointForSingleShardTxn) {
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdc_max_stream_intent_records) = 10;
   ANNOTATE_UNPROTECTED_WRITE(FLAGS_cdcsdk_vwal_getchanges_resp_max_size_bytes) = 1_KB;

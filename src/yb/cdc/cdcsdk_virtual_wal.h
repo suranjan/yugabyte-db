@@ -444,6 +444,11 @@ class CDCSDKVirtualWAL {
   // committed after it is shipped, since it would be shipped again after the conversion with an
   // LSN computed for an implicit slot.
   HybridTime implicit_conversion_stop_time_ = HybridTime::kInvalid;
+
+  // Set to true once the first full poll round across all tablet queues completes
+  // (i.e. empty_tablet_queues becomes empty for the first time). After this point,
+  // safe_time is considered reliable for keepalive messages.
+  bool first_full_poll_round_completed_ = false;
 };
 
 }  // namespace cdc

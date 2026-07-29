@@ -803,6 +803,8 @@ typedef struct {
   YbcPgAbortedSubtxnSet* aborted_subtxn_sets;
   int aborted_subtxn_sets_count;
   void* response;
+  uint64_t safe_time;
+  bool poll_round_complete;
 } YbcPgChangeRecordBatch;
 
 typedef struct {

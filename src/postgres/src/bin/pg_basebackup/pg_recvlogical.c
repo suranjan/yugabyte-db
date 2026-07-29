@@ -459,6 +459,15 @@ StreamLogicalLog(void)
 
 			pos += 8;			/* read walEnd */
 
+			{
+				int64		sendTime = fe_recvint64(&copybuf[pos]);
+
+				if (verbose)
+					pg_log_info("keepalive: walEnd %X/%X, sendTime/safeTime " INT64_FORMAT
+								", replyRequested %d",
+								LSN_FORMAT_ARGS(walEnd), sendTime,
+								(r >= pos + 8 + 1) ? copybuf[pos + 8] : -1);
+			}
 			pos += 8;			/* skip sendTime */
 
 			if (r < pos + 1)
@@ -520,6 +529,17 @@ StreamLogicalLog(void)
 
 		/* Extract WAL location for this block */
 		cur_record_lsn = fe_recvint64(&copybuf[1]);
+
+		if (verbose)
+		{
+			XLogRecPtr walEnd = fe_recvint64(&copybuf[9]);
+			int64 sendTime = fe_recvint64(&copybuf[17]);
+
+			pg_log_info("xlogdata: dataStart %X/%X, walEnd %X/%X, "
+						"sendTime/safeTime " INT64_FORMAT,
+						LSN_FORMAT_ARGS(cur_record_lsn),
+						LSN_FORMAT_ARGS(walEnd), sendTime);
+		}
 
 		if (endpos != InvalidXLogRecPtr && cur_record_lsn > endpos)
 		{

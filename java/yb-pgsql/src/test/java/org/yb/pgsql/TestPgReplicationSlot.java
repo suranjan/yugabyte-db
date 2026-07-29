@@ -30,6 +30,9 @@ import com.yugabyte.replication.LogSequenceNumber;
 import com.yugabyte.replication.PGReplicationConnection;
 import com.yugabyte.replication.PGReplicationStream;
 import com.yugabyte.util.PSQLException;
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.InputStreamReader;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.sql.Connection;
@@ -52,6 +55,8 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import org.apache.commons.lang3.StringUtils;
 import org.junit.Ignore;
@@ -8476,5 +8481,172 @@ public class TestPgReplicationSlot extends BasePgSQLTest {
     assertTrue(receiveMessage(stream, 4).contains(PgOutputInsertMessage.Create("2")));
     stream.close();
     conn.close();
+  }
+
+  @Test
+  public void testKeepaliveSafeTimeViaPgRecvLogical() throws Exception {
+    final String slotName = "keepalive_safe_time_slot";
+
+    try (Statement stmt = connection.createStatement()) {
+      stmt.execute("DROP TABLE IF EXISTS t_keepalive");
+      stmt.execute("CREATE TABLE t_keepalive (a int primary key, b text)");
+      stmt.execute("CREATE PUBLICATION pub_keepalive FOR TABLE t_keepalive");
+      stmt.execute("SELECT pg_create_logical_replication_slot('"
+          + slotName + "', 'yboutput')");
+      stmt.execute("INSERT INTO t_keepalive VALUES (1, 'hello')");
+      stmt.execute("INSERT INTO t_keepalive VALUES (2, 'world')");
+    }
+
+    File pgBinDir = PgRegressBuilder.getPgBinDir();
+    File pgRecvLogical = new File(pgBinDir, "pg_recvlogical");
+
+    // Use a conninfo string with options to set wal_sender_timeout to 2s so
+    // keepalives arrive quickly (default 60s would take 30s for first keepalive).
+    String conninfo = String.format(
+        "host=%s port=%d user=%s dbname=%s options='-c wal_sender_timeout=2000'",
+        getPgHost(0), getPgPort(0), DEFAULT_PG_USER, DEFAULT_PG_DATABASE);
+
+    List<String> args = Arrays.asList(
+        pgRecvLogical.toString(),
+        "--verbose",
+        "-d", conninfo,
+        "-S", slotName,
+        "--start",
+        "--no-loop",
+        "-o", "proto_version=1",
+        "-o", "publication_names=pub_keepalive",
+        "-f", "-"
+    );
+
+    ProcessBuilder pb = new ProcessBuilder(args);
+    pb.redirectErrorStream(false);
+    Process process = pb.start();
+
+    BufferedReader stderrReader =
+        new BufferedReader(new InputStreamReader(process.getErrorStream()));
+    BufferedReader stdoutReader =
+        new BufferedReader(new InputStreamReader(process.getInputStream()));
+
+    // Drain stdout in a background thread so the process doesn't block.
+    Thread stdoutDrainer = new Thread(() -> {
+      try {
+        while (stdoutReader.readLine() != null) {}
+      } catch (Exception e) {}
+    });
+    stdoutDrainer.setDaemon(true);
+    stdoutDrainer.start();
+
+    // Insert more data while pg_recvlogical is running so we get a mix of
+    // xlogdata and keepalive messages.
+    Thread inserter = new Thread(() -> {
+      try {
+        Thread.sleep(2000);
+        try (Statement stmt = connection.createStatement()) {
+          stmt.execute("INSERT INTO t_keepalive VALUES (3, 'after_start')");
+        }
+      } catch (Exception e) {
+        LOG.warn("Inserter thread failed", e);
+      }
+    });
+    inserter.setDaemon(true);
+    inserter.start();
+
+    // Patterns to extract safe_time from verbose output.
+    // Format: "keepalive: walEnd 0/17, sendTime/safeTime 12345, replyRequested 0"
+    // Format: "xlogdata: dataStart 0/2, walEnd 0/17, sendTime/safeTime 12345"
+    Pattern keepalivePattern = Pattern.compile(
+        "keepalive:.*sendTime/safeTime\\s+(\\d+)");
+    Pattern xlogdataPattern = Pattern.compile(
+        "xlogdata:.*sendTime/safeTime\\s+(\\d+)");
+
+    List<Long> keepaliveSafeTimes = new ArrayList<>();
+    List<Long> xlogdataSafeTimes = new ArrayList<>();
+    List<Long> allSafeTimesInOrder = new ArrayList<>();
+
+    // With wal_sender_timeout=2s, keepalives are sent every 1s once the stream
+    // is idle. Allow up to 30s (more for sanitizers) to collect messages.
+    long deadlineMs = System.currentTimeMillis()
+        + 30000 * BuildTypeUtil.nonSanitizerVsSanitizer(1, 3);
+    while (System.currentTimeMillis() < deadlineMs) {
+      if (!stderrReader.ready()) {
+        Thread.sleep(200);
+        continue;
+      }
+      String line = stderrReader.readLine();
+      if (line == null) break;
+      LOG.info("pg_recvlogical stderr: {}", line);
+
+      Matcher km = keepalivePattern.matcher(line);
+      if (km.find()) {
+        long safeTime = Long.parseLong(km.group(1));
+        keepaliveSafeTimes.add(safeTime);
+        allSafeTimesInOrder.add(safeTime);
+      }
+      Matcher xm = xlogdataPattern.matcher(line);
+      if (xm.find()) {
+        long safeTime = Long.parseLong(xm.group(1));
+        xlogdataSafeTimes.add(safeTime);
+        allSafeTimesInOrder.add(safeTime);
+      }
+
+      // Collect enough messages then stop.
+      if (keepaliveSafeTimes.size() >= 3 && xlogdataSafeTimes.size() >= 1) {
+        break;
+      }
+    }
+
+    process.destroyForcibly();
+    process.waitFor();
+
+    LOG.info("Collected {} keepalive safe_times and {} xlogdata safe_times",
+        keepaliveSafeTimes.size(), xlogdataSafeTimes.size());
+
+    // --- Invariant 1: We received at least one keepalive with a positive safe_time ---
+    assertTrue("Expected at least one keepalive with safe_time > 0, got: "
+        + keepaliveSafeTimes, keepaliveSafeTimes.size() >= 1);
+    for (long st : keepaliveSafeTimes) {
+      assertTrue("Keepalive safe_time should be > 0, got: " + st, st > 0);
+    }
+
+    // --- Invariant 2: safe_time never goes backwards across all messages ---
+    for (int i = 1; i < allSafeTimesInOrder.size(); i++) {
+      assertTrue(
+          String.format("safe_time must not go backwards: index %d has %d but index %d has %d",
+              i - 1, allSafeTimesInOrder.get(i - 1), i, allSafeTimesInOrder.get(i)),
+          allSafeTimesInOrder.get(i) >= allSafeTimesInOrder.get(i - 1));
+    }
+
+    // --- Invariant 3: keepalive safe_times are monotonically non-decreasing ---
+    for (int i = 1; i < keepaliveSafeTimes.size(); i++) {
+      assertTrue(
+          String.format("Keepalive safe_time must not decrease: %d -> %d",
+              keepaliveSafeTimes.get(i - 1), keepaliveSafeTimes.get(i)),
+          keepaliveSafeTimes.get(i) >= keepaliveSafeTimes.get(i - 1));
+    }
+
+    // --- Invariant 4: xlogdata safe_times >= any preceding keepalive safe_time ---
+    if (!keepaliveSafeTimes.isEmpty() && !xlogdataSafeTimes.isEmpty()) {
+      int keepaliveIdx = 0;
+      long lastKeepaliveSafeTime = 0;
+      for (long st : allSafeTimesInOrder) {
+        if (keepaliveIdx < keepaliveSafeTimes.size()
+            && st == keepaliveSafeTimes.get(keepaliveIdx)) {
+          lastKeepaliveSafeTime = st;
+          keepaliveIdx++;
+        } else if (lastKeepaliveSafeTime > 0) {
+          assertTrue(
+              String.format("xlogdata safe_time %d must be >= last keepalive safe_time %d",
+                  st, lastKeepaliveSafeTime),
+              st >= lastKeepaliveSafeTime);
+        }
+      }
+    }
+
+    // Cleanup.
+    try (Statement stmt = connection.createStatement()) {
+      stmt.execute("SELECT pg_drop_replication_slot('" + slotName + "')");
+      stmt.execute("DROP PUBLICATION pub_keepalive");
+      stmt.execute("DROP TABLE t_keepalive");
+    }
   }
 }
