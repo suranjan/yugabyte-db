@@ -632,6 +632,9 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 	CatalogTupleInsert(rel, tup);
 	heap_freetuple(tup);
 
+	elog(DEBUG2, "YB_PG_SUB: [1/6 CREATE] inserted subscription oid=%u name=\"%s\" into pg_subscription",
+		 subid, stmt->subname);
+
 	recordDependencyOnOwner(SubscriptionRelationId, subid, owner);
 
 	snprintf(originname, sizeof(originname), "pg_%u", subid);
@@ -684,6 +687,8 @@ CreateSubscription(ParseState *pstate, CreateSubscriptionStmt *stmt,
 
 				AddSubscriptionRelState(subid, relid, table_state,
 										InvalidXLogRecPtr);
+				elog(DEBUG2, "YB_PG_SUB: [1/6 CREATE] added rel oid=%u to pg_subscription_rel with state='%c'",
+					 relid, table_state);
 			}
 
 			/*

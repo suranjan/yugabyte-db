@@ -51,6 +51,7 @@
 
 /* YB includes */
 #include "pg_yb_utils.h"
+#include "utils/inval.h"
 #include "yb/yql/pggate/ybc_pggate.h"
 
 /* max sleep time between cycles (3min) */
@@ -417,6 +418,8 @@ retry:
 	bgw.bgw_notify_pid = MyProcPid;
 	bgw.bgw_main_arg = Int32GetDatum(slot);
 
+	elog(DEBUG2, "YB_PG_SUB: [3/6 LAUNCH] registering bgworker \"%s\" for sub=%u rel=%u",
+		 bgw.bgw_name, subid, relid);
 	if (!RegisterDynamicBackgroundWorker(&bgw, &bgw_handle))
 	{
 		/* Failed to start worker, so clean up the worker slot. */
@@ -812,6 +815,7 @@ ApplyLauncherMain(Datum main_arg)
 
 	ereport(DEBUG1,
 			(errmsg_internal("logical replication launcher started")));
+	elog(DEBUG2, "YB_PG_SUB: [2/6 LAUNCHER] logical replication launcher started, pid=%d", MyProcPid);
 
 	before_shmem_exit(logicalrep_launcher_onexit, (Datum) 0);
 
@@ -859,7 +863,12 @@ ApplyLauncherMain(Datum main_arg)
 
 			/*
 			 * YB: Reset the catalog read time so the scan of
-			 * pg_subscription reads fresh data from DocDB.
+			 * pg_subscription reads fresh data from DocDB.  The launcher
+			 * has no database (MyDatabaseId is invalid), so we cannot use
+			 * YbGetSharedCatalogVersion() which requires a DB OID in
+			 * per-database catalog version mode.  Instead, unconditionally
+			 * reset the read time -- this is cheap and guarantees we
+			 * always see newly created or dropped subscriptions.
 			 */
 			if (IsYugaByteEnabled())
 				YbInvalidateCatalogSnapshot();
@@ -868,10 +877,16 @@ ApplyLauncherMain(Datum main_arg)
 			sublist = get_subscription_list();
 
 			/* Start the missing workers for enabled subscriptions. */
+			if (list_length(sublist) > 0)
+				elog(DEBUG2, "YB_PG_SUB: [2/6 LAUNCHER] found %d subscription(s) in pg_subscription",
+					 list_length(sublist));
 			foreach(lc, sublist)
 			{
 				Subscription *sub = (Subscription *) lfirst(lc);
 				LogicalRepWorker *w;
+
+				elog(DEBUG2, "YB_PG_SUB: [2/6 LAUNCHER] subscription \"%s\" (oid=%u, dbid=%u, enabled=%d)",
+					 sub->name, sub->oid, sub->dbid, sub->enabled);
 
 				if (!sub->enabled)
 					continue;
@@ -894,11 +909,18 @@ ApplyLauncherMain(Datum main_arg)
 						continue;
 					}
 
+					elog(DEBUG2, "YB_PG_SUB: [2/6 LAUNCHER] no worker for \"%s\" (oid=%u), launching apply worker",
+						 sub->name, sub->oid);
 					last_start_time = now;
 					wait_time = wal_retrieve_retry_interval;
 
 					logicalrep_worker_launch(sub->dbid, sub->oid, sub->name,
 											 sub->owner, InvalidOid);
+				}
+				else
+				{
+					elog(DEBUG2, "YB_PG_SUB: [2/6 LAUNCHER] worker already running for \"%s\" (oid=%u, pid=%d)",
+						 sub->name, sub->oid, w->proc ? w->proc->pid : 0);
 				}
 			}
 

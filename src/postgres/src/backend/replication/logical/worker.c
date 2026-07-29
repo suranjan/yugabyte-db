@@ -285,6 +285,15 @@ static XLogRecPtr remote_final_lsn = InvalidXLogRecPtr;
  */
 bool		yb_publisher_is_yb = false;
 
+/*
+ * YB: Hybrid-time-based synchronization variables. These carry the raw hybrid
+ * time from the protocol committime field (when the publisher is YB) and are
+ * used instead of remote_final_lsn for tablesync coordination.
+ * remote_final_lsn itself is left untouched to preserve all PG LSN assertions.
+ */
+static XLogRecPtr yb_remote_commit_ht = InvalidXLogRecPtr;
+static XLogRecPtr yb_last_commit_ht = InvalidXLogRecPtr;
+
 /* fields valid only when processing streamed transaction */
 static bool in_streamed_transaction = false;
 
@@ -434,9 +443,39 @@ should_apply_changes_for_rel(LogicalRepRelMapEntry *rel)
 	if (am_tablesync_worker())
 		return MyLogicalRepWorker->relid == rel->localreloid;
 	else
-		return (rel->state == SUBREL_STATE_READY ||
-				(rel->state == SUBREL_STATE_SYNCDONE &&
-				 rel->statelsn <= remote_final_lsn));
+	{
+		bool		result;
+
+		if (yb_publisher_is_yb)
+			/*
+			 * YB publisher: Use strict < for the HT comparison.  The
+			 * tablesync COPY reads at exactly statelsn (the snapshot HT from
+			 * CREATE_REPLICATION_SLOT), so all rows with commit_ht <=
+			 * statelsn are already captured by the COPY.  Only transactions
+			 * committed strictly after the snapshot should be applied by the
+			 * streaming apply worker.
+			 */
+			result = (rel->state == SUBREL_STATE_READY ||
+					  (rel->state == SUBREL_STATE_SYNCDONE &&
+					   rel->statelsn < yb_remote_commit_ht));
+		else
+			result = (rel->state == SUBREL_STATE_READY ||
+					  (rel->state == SUBREL_STATE_SYNCDONE &&
+					   rel->statelsn <= remote_final_lsn));
+
+		if (!result)
+			elog(WARNING, "YB_PG_SUB: SKIPPING DML for rel %u (\"%s\"): "
+				 "state='%c' statelsn=%X/%X remote_final_lsn=%X/%X "
+				 "yb_remote_commit_ht=%lu",
+				 rel->localreloid,
+				 rel->localrel ? RelationGetRelationName(rel->localrel) : "?",
+				 rel->state,
+				 LSN_FORMAT_ARGS(rel->statelsn),
+				 LSN_FORMAT_ARGS(remote_final_lsn),
+				 (unsigned long) yb_remote_commit_ht);
+
+		return result;
+	}
 }
 
 /*
@@ -884,6 +923,13 @@ apply_handle_begin(StringInfo s)
 	if (IsYugaByteEnabled())
 		replorigin_session_origin_timestamp = begin_data.committime;
 
+	if (yb_publisher_is_yb)
+		yb_remote_commit_ht = (XLogRecPtr) begin_data.committime;
+
+	elog(DEBUG2, "YB_PG_SUB: [6/6 APPLY] BEGIN xid=%u final_lsn=%X/%X commit_ht=%lu",
+		 begin_data.xid, LSN_FORMAT_ARGS(begin_data.final_lsn),
+		 (unsigned long) yb_remote_commit_ht);
+
 	maybe_start_skipping_changes(begin_data.final_lsn);
 
 	in_remote_transaction = true;
@@ -913,7 +959,10 @@ apply_handle_commit(StringInfo s)
 	apply_handle_commit_internal(&commit_data);
 
 	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(commit_data.end_lsn);
+	if (yb_publisher_is_yb)
+		process_syncing_tables(yb_last_commit_ht);
+	else
+		process_syncing_tables(commit_data.end_lsn);
 
 	pgstat_report_activity(STATE_IDLE, NULL);
 	reset_apply_error_context_info();
@@ -940,6 +989,9 @@ apply_handle_begin_prepare(StringInfo s)
 
 	if (IsYugaByteEnabled())
 		replorigin_session_origin_timestamp = begin_data.prepare_time;
+
+	if (yb_publisher_is_yb)
+		yb_remote_commit_ht = (XLogRecPtr) begin_data.prepare_time;
 
 	maybe_start_skipping_changes(begin_data.prepare_lsn);
 
@@ -1022,7 +1074,10 @@ apply_handle_prepare(StringInfo s)
 	in_remote_transaction = false;
 
 	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(prepare_data.end_lsn);
+	if (yb_publisher_is_yb)
+		process_syncing_tables(yb_last_commit_ht);
+	else
+		process_syncing_tables(prepare_data.end_lsn);
 
 	/*
 	 * Since we have already prepared the transaction, in a case where the
@@ -1072,7 +1127,10 @@ apply_handle_commit_prepared(StringInfo s)
 	in_remote_transaction = false;
 
 	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(prepare_data.end_lsn);
+	if (yb_publisher_is_yb)
+		process_syncing_tables(yb_last_commit_ht);
+	else
+		process_syncing_tables(prepare_data.end_lsn);
 
 	clear_subscription_skip_lsn(prepare_data.end_lsn);
 
@@ -1127,7 +1185,10 @@ apply_handle_rollback_prepared(StringInfo s)
 	in_remote_transaction = false;
 
 	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(rollback_data.rollback_end_lsn);
+	if (yb_publisher_is_yb)
+		process_syncing_tables(yb_last_commit_ht);
+	else
+		process_syncing_tables(rollback_data.rollback_end_lsn);
 
 	pgstat_report_activity(STATE_IDLE, NULL);
 	reset_apply_error_context_info();
@@ -1182,7 +1243,10 @@ apply_handle_stream_prepare(StringInfo s)
 	stream_cleanup_files(MyLogicalRepWorker->subid, prepare_data.xid);
 
 	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(prepare_data.end_lsn);
+	if (yb_publisher_is_yb)
+		process_syncing_tables(yb_last_commit_ht);
+	else
+		process_syncing_tables(prepare_data.end_lsn);
 
 	/*
 	 * Similar to prepare case, the subskiplsn could be left in a case of
@@ -1573,7 +1637,10 @@ apply_handle_stream_commit(StringInfo s)
 	stream_cleanup_files(MyLogicalRepWorker->subid, xid);
 
 	/* Process any tables that are being synchronized in parallel. */
-	process_syncing_tables(commit_data.end_lsn);
+	if (yb_publisher_is_yb)
+		process_syncing_tables(yb_last_commit_ht);
+	else
+		process_syncing_tables(commit_data.end_lsn);
 
 	pgstat_report_activity(STATE_IDLE, NULL);
 
@@ -1614,9 +1681,16 @@ apply_handle_commit_internal(LogicalRepCommitData *commit_data)
 		replorigin_session_origin_timestamp = commit_data->committime;
 
 		CommitTransactionCommand();
+
+		if (yb_publisher_is_yb)
+			yb_last_commit_ht = (XLogRecPtr) commit_data->committime;
+
 		pgstat_report_stat(false);
 
 		store_flush_position(commit_data->end_lsn);
+		elog(DEBUG2, "YB_PG_SUB: [6/6 APPLY] COMMIT end_lsn=%X/%X last_commit_ht=%lu",
+			 LSN_FORMAT_ARGS(commit_data->end_lsn),
+			 (unsigned long) yb_last_commit_ht);
 	}
 	else
 	{
@@ -1773,6 +1847,9 @@ apply_handle_insert(StringInfo s)
 	slot_store_data(remoteslot, rel, &newtup);
 	slot_fill_defaults(rel, estate, remoteslot);
 	MemoryContextSwitchTo(oldctx);
+
+	elog(DEBUG2, "YB_PG_SUB: [6/6 APPLY] INSERT on \"%s\"",
+		 RelationGetRelationName(rel->localrel));
 
 	/* For a partitioned table, insert the tuple into a partition. */
 	if (rel->localrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
@@ -1979,6 +2056,9 @@ apply_handle_update(StringInfo s)
 					has_oldtup ? &oldtup : &newtup);
 	MemoryContextSwitchTo(oldctx);
 
+	elog(DEBUG2, "YB_PG_SUB: [6/6 APPLY] UPDATE on \"%s\"",
+		 RelationGetRelationName(rel->localrel));
+
 	/* YB: decided here because the local row may not be read at all. */
 	edata->yb_needs_local_row =
 		YbReplUpdateNeedsLocalRow(rel, has_oldtup, &oldtup, &newtup,
@@ -2125,6 +2205,9 @@ apply_handle_delete(StringInfo s)
 	oldctx = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 	slot_store_data(remoteslot, rel, &oldtup);
 	MemoryContextSwitchTo(oldctx);
+
+	elog(DEBUG2, "YB_PG_SUB: [6/6 APPLY] DELETE on \"%s\"",
+		 RelationGetRelationName(rel->localrel));
 
 	/* For a partitioned table, apply delete to correct partition. */
 	if (rel->localrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
@@ -2922,6 +3005,46 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 	errcallback.previous = error_context_stack;
 	error_context_stack = &errcallback;
 
+	/*
+	 * YB: Seed yb_last_commit_ht with the starting position so that the
+	 * CATCHUP->SYNCDONE and SYNCDONE->READY comparisons succeed immediately
+	 * when no DML has been received yet.  This mirrors how PG's last_received
+	 * is seeded with origin_startpos.
+	 *
+	 * Only seed when last_received looks like a Hybrid Time (> 2^40).
+	 * On apply worker restart, origin_startpos comes from
+	 * replorigin_session_get_progress() which stores the sequential VWAL LSN
+	 * (a small value like 0/30D8).  Seeding yb_last_commit_ht with a
+	 * sequential LSN would leave it stuck at a tiny value that can never
+	 * satisfy the SYNCDONE->READY comparison against the tablesync snapshot
+	 * HT.  In that case, leave yb_last_commit_ht at 0 and let incoming data
+	 * messages or keepalives advance it.
+	 *
+	 * IMPORTANT: After seeding yb_last_commit_ht, reset last_received to
+	 * InvalidXLogRecPtr.  The last_received variable is used by
+	 * send_feedback() to report the flush/write/apply positions back to the
+	 * publisher's VWAL.  The VWAL expects sequential LSN values (starting
+	 * from 1), not hybrid time values.  If we leave the HT value in
+	 * last_received, send_feedback() will send it as confirmed_flush_lsn,
+	 * causing the VWAL to believe all data has been consumed and return
+	 * only empty responses.
+	 */
+	if (yb_publisher_is_yb)
+	{
+		if (last_received > ((XLogRecPtr) 1 << 40))
+			yb_last_commit_ht = last_received;
+		else
+			elog(DEBUG2, "YB_PG_SUB: [6/6 APPLY] not seeding yb_last_commit_ht "
+				 "from origin_startpos %X/%X (sequential VWAL LSN, not HT)",
+				 LSN_FORMAT_ARGS(last_received));
+		last_received = InvalidXLogRecPtr;
+	}
+
+	elog(DEBUG2, "YB_PG_SUB: [6/6 APPLY] entering apply loop, last_received=%X/%X "
+		 "yb_last_commit_ht=%X/%X",
+		 LSN_FORMAT_ARGS(last_received),
+		 LSN_FORMAT_ARGS(yb_last_commit_ht));
+
 	/* This outer loop iterates once per wait. */
 	for (;;)
 	{
@@ -2991,6 +3114,21 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 						if (last_received < end_lsn)
 							last_received = end_lsn;
 
+						/*
+						 * YB: Do NOT advance yb_last_commit_ht from the data
+						 * message send_time here.  The send_time carries the
+						 * VWAL safe_time, which reflects the last COMMIT in
+						 * the batch — potentially a later transaction than the
+						 * one this record belongs to.  Advancing
+						 * yb_last_commit_ht prematurely could cause the
+						 * SYNCDONE->READY comparison to succeed before the
+						 * current transaction is committed.
+						 *
+						 * yb_last_commit_ht is advanced by:
+						 *  - apply_handle_commit (committime of each txn)
+						 *  - keepalive handler (safe_time during idle)
+						 */
+
 						UpdateWorkerStats(last_received, send_time, false);
 
 						apply_dispatch(&s);
@@ -3007,6 +3145,22 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 
 						if (last_received < end_lsn)
 							last_received = end_lsn;
+
+						/*
+						 * YB: The walsender repurposes the keepalive timestamp
+						 * to carry the VWAL safe_time (Hybrid Time).  Advance
+						 * yb_last_commit_ht so the SYNCDONE->READY transition
+						 * can succeed even when no DML is flowing.
+						 */
+						if (yb_publisher_is_yb &&
+							(XLogRecPtr) timestamp > yb_last_commit_ht)
+						{
+							elog(DEBUG2, "YB_PG_SUB: keepalive advancing "
+								 "yb_last_commit_ht from %X/%X to %X/%X",
+								 LSN_FORMAT_ARGS(yb_last_commit_ht),
+								 LSN_FORMAT_ARGS((XLogRecPtr) timestamp));
+							yb_last_commit_ht = (XLogRecPtr) timestamp;
+						}
 
 						send_feedback(last_received, reply_requested, false);
 						UpdateWorkerStats(last_received, timestamp, true);
@@ -3054,7 +3208,10 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 			maybe_reread_subscription();
 
 			/* Process any table synchronization changes. */
-			process_syncing_tables(last_received);
+			if (yb_publisher_is_yb)
+				process_syncing_tables(yb_last_commit_ht);
+			else
+				process_syncing_tables(last_received);
 		}
 
 		/* Cleanup the memory. */
@@ -3823,6 +3980,9 @@ start_apply(XLogRecPtr origin_startpos)
  * that are hybrid times on a YB publisher (the CREATE_REPLICATION_SLOT
  * snapshot name, protocol commit times) are ordinary PG values on a
  * PostgreSQL publisher and must not be reinterpreted.
+ *
+ * walrcv_exec with nRetTypes > 0 builds a TupleDesc via TupleDescInitEntry,
+ * which does a syscache lookup requiring an active transaction.
  */
 void
 yb_detect_publisher_type(void)
@@ -3974,6 +4134,14 @@ ApplyWorkerMain(Datum main_arg)
 								  (Datum) 0);
 
 	if (am_tablesync_worker())
+		elog(DEBUG2, "YB_PG_SUB: [4/6 WORKER] tablesync worker started for subscription \"%s\" (oid=%u), table oid=%u (\"%s\"), pid=%d",
+			 MySubscription->name, MySubscription->oid,
+			 MyLogicalRepWorker->relid, get_rel_name(MyLogicalRepWorker->relid), MyProcPid);
+	else
+		elog(DEBUG2, "YB_PG_SUB: [4/6 WORKER] apply worker started for subscription \"%s\" (oid=%u), pid=%d",
+			 MySubscription->name, MySubscription->oid, MyProcPid);
+
+	if (am_tablesync_worker())
 		ereport(LOG,
 				(errmsg("logical replication table synchronization worker for subscription \"%s\", table \"%s\" has started",
 						MySubscription->name, get_rel_name(MyLogicalRepWorker->relid))));
@@ -4045,11 +4213,12 @@ ApplyWorkerMain(Datum main_arg)
 	}
 
 	/* Connect to the origin and start the replication. */
-	elog(DEBUG1, "connecting to publisher using connection string \"%s\"",
+	elog(DEBUG2, "YB_PG_SUB: [4/6 WORKER] connecting to publisher: %s",
 		 MySubscription->conninfo);
 
 	if (am_tablesync_worker())
 	{
+		elog(DEBUG2, "YB_PG_SUB: [4/6 WORKER] starting table sync...");
 		start_table_sync(&origin_startpos, &myslotname);
 
 		/*
@@ -4134,6 +4303,25 @@ ApplyWorkerMain(Datum main_arg)
 	options.startpoint = origin_startpos;
 	options.slotname = myslotname;
 
+	/*
+	 * YB: When HT-based replication is enabled, origin_startpos for tablesync
+	 * workers contains a Hybrid Time value (not a sequential LSN).  The VWAL's
+	 * internal LSNs start from 1, so using the HT as START_REPLICATION
+	 * startpoint would cause the walsender to skip all records (it only sends
+	 * records with LSN > startpoint).  Use InvalidXLogRecPtr so the walsender
+	 * streams from the beginning.  The HT is preserved in origin_startpos and
+	 * will be passed to LogicalRepApplyLoop to seed yb_last_commit_ht for
+	 * subscriber-side state machine comparisons.
+	 */
+	if (yb_publisher_is_yb && am_tablesync_worker())
+	{
+		elog(DEBUG2, "YB_PG_SUB: [6/6 APPLY] tablesync: overriding "
+			 "options.startpoint from %X/%X (HT) to 0/0 for "
+			 "START_REPLICATION; HT preserved in origin_startpos",
+			 LSN_FORMAT_ARGS(options.startpoint));
+		options.startpoint = InvalidXLogRecPtr;
+	}
+
 	server_version = walrcv_server_version(LogRepWorkerWalRcvConn);
 	options.proto.logical.proto_version =
 		server_version >= 150000 ? LOGICALREP_PROTO_TWOPHASE_VERSION_NUM :
@@ -4188,6 +4376,8 @@ ApplyWorkerMain(Datum main_arg)
 	}
 
 	/* Run the main loop. */
+	elog(DEBUG2, "YB_PG_SUB: [6/6 APPLY] starting apply loop for subscription \"%s\", origin_startpos=%X/%X",
+		 MySubscription->name, LSN_FORMAT_ARGS(origin_startpos));
 	start_apply(origin_startpos);
 
 	proc_exit(0);

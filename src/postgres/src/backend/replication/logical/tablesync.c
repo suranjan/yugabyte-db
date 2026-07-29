@@ -315,6 +315,12 @@ process_syncing_tables_for_sync(XLogRecPtr current_lsn)
 
 		SpinLockRelease(&MyLogicalRepWorker->relmutex);
 
+		elog(DEBUG2, "YB_PG_SUB: [5/6 TABLESYNC] state -> SYNCDONE for sub=%u rel=%u "
+			 "lsn=%X/%X (is %s)",
+			 MyLogicalRepWorker->subid, MyLogicalRepWorker->relid,
+			 LSN_FORMAT_ARGS(current_lsn),
+			 yb_publisher_is_yb ? "commit_ht" : "lsn");
+
 		/*
 		 * UpdateSubscriptionRelState must be called within a transaction.
 		 * That transaction will be ended within the finish_sync_worker().
@@ -450,12 +456,24 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 	{
 		SubscriptionRelState *rstate = (SubscriptionRelState *) lfirst(lc);
 
+		elog(DEBUG2, "YB_PG_SUB: [4/6 APPLY] process_syncing rel=%u state='%c' "
+			 "rstate_lsn=%X/%X current_lsn=%X/%X (current_lsn is %s)",
+			 rstate->relid, rstate->state,
+			 LSN_FORMAT_ARGS(rstate->lsn),
+			 LSN_FORMAT_ARGS(current_lsn),
+			 yb_publisher_is_yb ? "commit_ht" : "lsn");
+
 		if (rstate->state == SUBREL_STATE_SYNCDONE)
 		{
 			/*
 			 * Apply has caught up to the position where the table sync has
 			 * finished.  Mark the table as ready so that the apply will just
 			 * continue to replicate it normally.
+			 *
+			 * YB: When the publisher is YB, current_lsn is yb_last_commit_ht
+			 * which advances via the VWAL safe_time carried in keepalive/data
+			 * messages.  When the publisher is PG, current_lsn is the
+			 * standard last_received LSN.
 			 */
 			if (current_lsn >= rstate->lsn)
 			{
@@ -463,6 +481,11 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 
 				rstate->state = SUBREL_STATE_READY;
 				rstate->lsn = current_lsn;
+				elog(DEBUG2, "YB_PG_SUB: [5/6 TABLESYNC] state -> READY for sub=%u rel=%u "
+					 "rstate_lsn=%X/%X current_lsn=%X/%X",
+					 MyLogicalRepWorker->subid, rstate->relid,
+					 LSN_FORMAT_ARGS(rstate->lsn),
+					 LSN_FORMAT_ARGS(current_lsn));
 				if (!started_tx)
 				{
 					StartTransactionCommand();
@@ -494,6 +517,14 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 				UpdateSubscriptionRelState(MyLogicalRepWorker->subid,
 										   rstate->relid, rstate->state,
 										   rstate->lsn);
+			}
+			else
+			{
+				elog(DEBUG2, "YB_PG_SUB: [5/6 TABLESYNC] SYNCDONE->READY waiting: "
+					 "sub=%u rel=%u current_lsn=%X/%X < rstate_lsn=%X/%X",
+					 MyLogicalRepWorker->subid, rstate->relid,
+					 LSN_FORMAT_ARGS(current_lsn),
+					 LSN_FORMAT_ARGS(rstate->lsn));
 			}
 		}
 		else
@@ -613,6 +644,11 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 
 /*
  * Process possible state change(s) of tables that are being synchronized.
+ *
+ * YB: When the publisher is YB (yb_publisher_is_yb == true), current_lsn
+ * carries a hybrid time (commit_ht) instead of an LSN.  The callers in
+ * worker.c pass yb_last_commit_ht for YB publishers and last_received for
+ * PG publishers.
  */
 void
 process_syncing_tables(XLogRecPtr current_lsn)
@@ -1159,7 +1195,11 @@ copy_table(Relation rel)
 	cstate = BeginCopyFrom(pstate, rel, NULL, NULL, false, copy_read_data, attnamelist, NIL);
 
 	/* Do the copy */
+	elog(DEBUG2, "YB_PG_SUB: [5/6 TABLESYNC] starting COPY for table \"%s.%s\"",
+		 lrel.nspname, lrel.relname);
 	(void) CopyFrom(cstate);
+	elog(DEBUG2, "YB_PG_SUB: [5/6 TABLESYNC] COPY completed for table \"%s.%s\"",
+		 lrel.nspname, lrel.relname);
 
 	logicalrep_rel_close(relmapentry, NoLock);
 }
@@ -1405,9 +1445,33 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	 * for the catchup phase after COPY is done, so tell it to use the
 	 * snapshot to make the final data consistent.
 	 */
-	walrcv_create_slot(LogRepWorkerWalRcvConn,
-					   slotname, false /* permanent */ , false /* two_phase */ ,
-					   CRS_USE_SNAPSHOT, origin_startpos);
+	{							/* YB */
+		XLogRecPtr	lsn_from_slot = InvalidXLogRecPtr;
+		char	   *snapshot_name;
+
+		snapshot_name = walrcv_create_slot(LogRepWorkerWalRcvConn,
+										   slotname, false /* permanent */ ,
+										   false /* two_phase */ ,
+										   CRS_USE_SNAPSHOT, origin_startpos);
+		lsn_from_slot = *origin_startpos;
+
+		/*
+		 * YB: the snapshot name is a hybrid time only when the publisher is
+		 * YB; a PostgreSQL publisher returns a real exported-snapshot name
+		 * here, which must not be reinterpreted as a number.
+		 */
+		if (yb_publisher_is_yb && snapshot_name != NULL)
+		{
+			uint64		yb_snapshot_ht = strtou64(snapshot_name, NULL, 10);
+
+			*origin_startpos = (XLogRecPtr) yb_snapshot_ht;
+			elog(DEBUG2, "YB_PG_SUB: [5/6 TABLESYNC] walrcv_create_slot: "
+				 "lsn=%X/%X snapshot_ht=%lu origin_startpos=%X/%X",
+				 LSN_FORMAT_ARGS(lsn_from_slot),
+				 (unsigned long) yb_snapshot_ht,
+				 LSN_FORMAT_ARGS(*origin_startpos));
+		}
+	}
 
 	/*
 	 * Setup replication origin tracking. The purpose of doing this before the
@@ -1464,6 +1528,8 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 	 * Update the persisted state to indicate the COPY phase is done; make it
 	 * visible to others.
 	 */
+	elog(DEBUG2, "YB_PG_SUB: [5/6 TABLESYNC] state -> FINISHEDCOPY for sub=%u rel=%u",
+		 MyLogicalRepWorker->subid, MyLogicalRepWorker->relid);
 	UpdateSubscriptionRelState(MyLogicalRepWorker->subid,
 							   MyLogicalRepWorker->relid,
 							   SUBREL_STATE_FINISHEDCOPY,
@@ -1473,9 +1539,10 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 
 copy_table_done:
 
-	elog(DEBUG1,
-		 "LogicalRepSyncTableStart: '%s' origin_startpos lsn %X/%X",
-		 originname, LSN_FORMAT_ARGS(*origin_startpos));
+	elog(DEBUG2, "YB_PG_SUB: [5/6 TABLESYNC] table sync done, origin='%s' "
+		 "startpos=%X/%X (is %s)",
+		 originname, LSN_FORMAT_ARGS(*origin_startpos),
+		 yb_publisher_is_yb ? "commit_ht" : "lsn");
 
 	/*
 	 * We are done with the initial data synchronization, update the state.

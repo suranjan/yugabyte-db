@@ -348,6 +348,8 @@ Status CDCSDKVirtualWAL::InitVirtualWALInternal(
     if (!s.ok()) {
       s = s.CloneAndPrepend(Format(
           "Error fetching tablet list & checkpoints for table_id $0: $1", table_id));
+      // Use WARNING instead of DFATAL: the CDC stream may have been deleted
+      // concurrently (e.g. DROP SUBSCRIPTION racing with walsender shutdown).
       LOG_WITH_PREFIX(WARNING) << s;
       return s;
     }

@@ -455,9 +455,18 @@ logicalrep_rel_open(LogicalRepRelId remoteid, LOCKMODE lockmode)
 	}
 
 	if (entry->state != SUBREL_STATE_READY)
+	{
+		char		yb_old_state = entry->state;
+
 		entry->state = GetSubscriptionRelState(MySubscription->oid,
 											   entry->localreloid,
 											   &entry->statelsn);
+		if (yb_old_state != entry->state)
+			elog(DEBUG2, "YB_PG_SUB: logicalrep_rel_open rel=%u state "
+				 "changed '%c' -> '%c' statelsn=%X/%X",
+				 entry->localreloid, yb_old_state, entry->state,
+				 LSN_FORMAT_ARGS(entry->statelsn));
+	}
 
 	return entry;
 }

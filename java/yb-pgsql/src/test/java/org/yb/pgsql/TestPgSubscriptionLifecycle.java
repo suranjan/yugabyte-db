@@ -424,13 +424,10 @@ public class TestPgSubscriptionLifecycle extends BasePgSubscriptionLifecycleTest
     waitForWorkerPid(SUB_NAME);
 
     /*
-     * The initial copy and the tablesync worker's state machine up to
-     * SYNCDONE are covered here.  The final SYNCDONE -> READY transition is
-     * performed by the apply worker based on the publisher's safe_time and
-     * is only reachable with the HT-based state machine (later in this
-     * stack), which extends this check to state 'r'.
+     * With the HT-based state machine the apply worker advances the table
+     * from SYNCDONE to READY based on the publisher's safe_time.
      */
-    waitForTableState(SUB_NAME, "t", 's');
+    waitForTableState(SUB_NAME, "t", 'r');
 
     try (Statement stmt = subConn.createStatement();
          ResultSet rs = stmt.executeQuery("SELECT count(*) FROM t")) {
