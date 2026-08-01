@@ -166,6 +166,7 @@ extern HeapTuple ybc_heap_getnext(TableScanDesc scanDesc);
 extern bool ybc_heap_getnextslot(TableScanDesc scanDesc,
 								 ScanDirection direction,
 								 TupleTableSlot *slot);
+extern void ybc_heap_rescan(TableScanDesc scanDesc, ScanKey key);
 extern void ybc_heap_endscan(TableScanDesc scanDesc);
 
 /*

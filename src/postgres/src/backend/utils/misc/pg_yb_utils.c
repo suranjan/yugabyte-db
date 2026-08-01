@@ -124,6 +124,7 @@
 #include "postmaster/interrupt.h"
 #include "replication/origin.h"
 #include "replication/slot.h"
+#include "replication/worker_internal.h"
 #ifndef HAVE_GETRUSAGE
 #include "rusagestub.h"
 #endif
@@ -1514,7 +1515,6 @@ typedef struct
 static YbDdlTransactionState ddl_transaction_state = {0};
 
 static void YBResetEnableSpecialDDLMode();
-static void YBResetDdlState();
 
 void
 YBCRecreateTransaction()
@@ -2753,7 +2753,11 @@ YBClearDdlTransactionState()
 	};
 }
 
-static void
+/*
+ * Exported so callers that enter DDL mode outside ProcessUtility (the logical
+ * replication apply worker) can recover the same way on error.
+ */
+void
 YBResetDdlState()
 {
 	YbcStatus	status = NULL;
@@ -11630,7 +11634,16 @@ HandleYBStatusAtErrorLevelImpl(YbcStatus status, int elevel, const char *text_do
 		YBCFreeStatus(status);
 		yb_errapply_yb_status(&status_data, 1);
 		errcode(pg_err_code);
-		errhidecontext(true);
+
+		/*
+		 * DocDB errors hide the PG error context, except in a logical
+		 * replication worker: there the context is the only report of which
+		 * change failed, and it carries the finish LSN that ALTER SUBSCRIPTION
+		 * ... SKIP needs.  Without it a conflict raised by storage - a
+		 * duplicate key, say - is unskippable, because nothing ever prints the
+		 * LSN to skip.
+		 */
+		errhidecontext(MyLogicalRepWorker == NULL);
 		if (yb_debug_log_docdb_error_backtrace)
 			errbacktrace();
 		errfinish(filename, lineno, funcname);

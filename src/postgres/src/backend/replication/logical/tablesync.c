@@ -1268,6 +1268,9 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("could not connect to the publisher: %s", err)));
 
+	/* YB: detect whether the publisher is YB or PG. */
+	yb_detect_publisher_type();
+
 	Assert(MyLogicalRepWorker->relstate == SUBREL_STATE_INIT ||
 		   MyLogicalRepWorker->relstate == SUBREL_STATE_DATASYNC ||
 		   MyLogicalRepWorker->relstate == SUBREL_STATE_FINISHEDCOPY);

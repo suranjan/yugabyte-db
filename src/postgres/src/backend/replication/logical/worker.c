@@ -197,6 +197,8 @@
 #include "utils/timeout.h"
 
 /* YB includes */
+#include "access/yb_special_scans.h"
+#include "executor/ybModifyTable.h"
 #include "pg_yb_utils.h"
 #include "utils/snapmgr.h"
 #include "yb/yql/pggate/ybc_pggate.h"
@@ -230,6 +232,13 @@ typedef struct ApplyExecutionData
 	/* These fields are used when the target relation is partitioned: */
 	ModifyTableState *mtstate;	/* dummy ModifyTable state */
 	PartitionTupleRouting *proute;	/* partition routing info */
+
+	/*
+	 * YB: whether this UPDATE must read the local row rather than write blind.
+	 * Decided from the replicated tuples, since the lookup depends on it.  See
+	 * YbReplUpdateNeedsLocalRow.
+	 */
+	bool		yb_needs_local_row;
 } ApplyExecutionData;
 
 /* Struct for saving and restoring apply errcontext information */
@@ -268,6 +277,14 @@ static bool MySubscriptionValid = false;
 
 bool		in_remote_transaction = false;
 static XLogRecPtr remote_final_lsn = InvalidXLogRecPtr;
+
+/*
+ * YB: true when the publisher this worker is connected to is a YugabyteDB
+ * instance.  Detected once per connection by yb_detect_publisher_type().
+ * Process-local, so a subscription to a PG publisher and one to a YB
+ * publisher can coexist; each worker sees its own publisher's type.
+ */
+bool		yb_publisher_is_yb = false;
 
 /* fields valid only when processing streamed transaction */
 static bool in_streamed_transaction = false;
@@ -354,7 +371,14 @@ static void apply_handle_delete_internal(ApplyExecutionData *edata,
 static bool FindReplTupleInLocalRel(EState *estate, Relation localrel,
 									LogicalRepRelation *remoterel,
 									TupleTableSlot *remoteslot,
-									TupleTableSlot **localslot);
+									TupleTableSlot **localslot,
+									bool yb_needs_local_row);
+static bool YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel,
+									  bool has_oldtup,
+									  LogicalRepTupleData *oldtup,
+									  LogicalRepTupleData *newtup,
+									  bool any_unsupplied,
+									  bool unsupplied_notnull);
 static void apply_handle_tuple_routing(ApplyExecutionData *edata,
 									   TupleTableSlot *remoteslot,
 									   LogicalRepTupleData *newtup,
@@ -1845,6 +1869,11 @@ apply_handle_update(StringInfo s)
 	RangeTblEntry *target_rte;
 	MemoryContext oldctx;
 
+	/* YB declarations */
+	AttrNumber	yb_minattr;
+	bool		yb_any_unsupplied = false;
+	bool		yb_unsupplied_notnull = false;
+
 	/*
 	 * Quick return if we are skipping data modification changes or handling
 	 * streamed transactions.
@@ -1891,18 +1920,46 @@ apply_handle_update(StringInfo s)
 	 * on the subscriber, since we are not touching those.
 	 */
 	target_rte = list_nth(estate->es_range_table, 0);
+
+	/*
+	 * YB: YB relations index updatedCols from YBFirstLowInvalidAttributeNumber,
+	 * not FirstLowInvalidHeapAttributeNumber (see analyze.c), so use the
+	 * relation's own base.
+	 */
+	yb_minattr = YBGetFirstLowInvalidAttributeNumber(rel->localrel);
+
 	for (int i = 0; i < remoteslot->tts_tupleDescriptor->natts; i++)
 	{
 		Form_pg_attribute att = TupleDescAttr(remoteslot->tts_tupleDescriptor, i);
 		int			remoteattnum = rel->attrmap->attnums[i];
+		bool		yb_supplied;
 
-		if (!att->attisdropped && remoteattnum >= 0)
+		if (att->attisdropped)
+			continue;
+
+		/*
+		 * YB: "supplied" means this change carries an actual value for the
+		 * column - it has a counterpart on the publisher and did not arrive
+		 * marked unchanged.  An unsupplied column is left out of the write, so
+		 * its stored value survives, but it is NULL in the slot and the slot is
+		 * validated as a whole (ExecConstraints).  Tracked here rather than in
+		 * a second pass, since this loop already visits every column.
+		 */
+		yb_supplied = (remoteattnum >= 0 &&
+					   newtup.colstatus[remoteattnum] != LOGICALREP_COLUMN_UNCHANGED);
+
+		if (yb_supplied)
 		{
 			Assert(remoteattnum < newtup.ncols);
-			if (newtup.colstatus[remoteattnum] != LOGICALREP_COLUMN_UNCHANGED)
-				target_rte->updatedCols =
-					bms_add_member(target_rte->updatedCols,
-								   i + 1 - FirstLowInvalidHeapAttributeNumber);
+			target_rte->updatedCols =
+				bms_add_member(target_rte->updatedCols,
+							   i + 1 - yb_minattr);
+		}
+		else
+		{
+			yb_any_unsupplied = true;
+			if (att->attnotnull)
+				yb_unsupplied_notnull = true;
 		}
 	}
 
@@ -1911,6 +1968,11 @@ apply_handle_update(StringInfo s)
 	slot_store_data(remoteslot, rel,
 					has_oldtup ? &oldtup : &newtup);
 	MemoryContextSwitchTo(oldctx);
+
+	/* YB: decided here because the local row may not be read at all. */
+	edata->yb_needs_local_row =
+		YbReplUpdateNeedsLocalRow(rel, has_oldtup, &oldtup, &newtup,
+								  yb_any_unsupplied, yb_unsupplied_notnull);
 
 	/* For a partitioned table, apply update to correct partition. */
 	if (rel->localrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
@@ -1928,6 +1990,138 @@ apply_handle_update(StringInfo s)
 	logicalrep_rel_close(rel, NoLock);
 
 	end_replication_step();
+}
+
+/*
+ * Copy a virtual tuple slot into a new heap tuple slot.  Used when applying
+ * changes to YB relations, where the executor expects a heap slot for
+ * slot_getattr() / ybctid computation.
+ */
+static TupleTableSlot *
+CopyVirtualSlotToHeapSlot(EState *estate, TupleTableSlot *virtualslot,
+						  TupleDesc tupdesc)
+{
+	TupleTableSlot *heapslot = ExecInitExtraTupleSlot(estate, tupdesc,
+													  &TTSOpsHeapTuple);
+
+	return ExecCopySlot(heapslot, virtualslot);
+}
+
+/*
+ * YB: must this UPDATE read the local row, or can it write blind?
+ *
+ * A blind write is safe because YBCExecuteUpdate stores only the columns in
+ * updatedCols, so a column this change does not supply keeps its stored value
+ * without ever being read.  Only such a column forces a read, being NULL in the
+ * slot, and three things expose that:
+ *
+ * A key change.  It is applied as delete plus insert
+ * (YBCExecuteUpdateReplace), and that insert stores every column of the slot,
+ * so an unsupplied column - NULL in the slot - would be persisted as NULL.  The
+ * publisher sends an old tuple only when the replica identity columns changed
+ * or the identity is FULL, so with no old tuple the key is unchanged; otherwise
+ * the keys are compared.  Comparing the replicated values rather than the
+ * stored ones is what lets this be decided before the lookup, and it errs in
+ * the safe direction: identical bytes are certainly the same value, while a
+ * spurious difference only costs a read.
+ *
+ * An unsupplied NOT NULL column.  The write skips it, but ExecSimpleRelationUpdate
+ * validates the whole slot, and ExecConstraints rejects the NULL even though
+ * that column was never going to be written.
+ *
+ * A partitioned target is taken conservatively: NOT NULL is judged here from the
+ * root, and a partition may be stricter.  Whatever else a leaf needs - its
+ * indexes, triggers, check constraints, stored generated columns -
+ * YbApplyCanSkipLocalFetch retests against the leaf itself.
+ */
+static bool
+YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel, bool has_oldtup,
+						  LogicalRepTupleData *oldtup,
+						  LogicalRepTupleData *newtup,
+						  bool any_unsupplied, bool unsupplied_notnull)
+{
+	Bitmapset  *pkey;
+	AttrNumber	minattr;
+	int			col = -1;
+
+	if (!IsYBRelation(rel->localrel))
+		return false;
+
+	/* The slot carries every column, so any write of it is complete. */
+	if (!any_unsupplied)
+		return false;
+
+	if (unsupplied_notnull)
+		return true;
+
+	if (rel->localrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+		rel->localrel->rd_rel->relispartition)
+		return true;
+
+	if (!has_oldtup)
+		return false;
+
+	pkey = YBGetTablePrimaryKeyBms(rel->localrel);
+	minattr = YBGetFirstLowInvalidAttributeNumber(rel->localrel);
+
+	while ((col = bms_next_member(pkey, col)) >= 0)
+	{
+		AttrNumber	attnum = col + minattr;
+		int			remoteattnum;
+
+		/* ybrowid and other system keys are never sent by the publisher. */
+		if (attnum <= 0)
+			continue;
+
+		remoteattnum = rel->attrmap->attnums[attnum - 1];
+		if (remoteattnum < 0 ||
+			remoteattnum >= oldtup->ncols ||
+			remoteattnum >= newtup->ncols)
+			continue;
+
+		if (oldtup->colstatus[remoteattnum] != newtup->colstatus[remoteattnum])
+			return true;
+
+		if (newtup->colstatus[remoteattnum] == LOGICALREP_COLUMN_TEXT ||
+			newtup->colstatus[remoteattnum] == LOGICALREP_COLUMN_BINARY)
+		{
+			StringInfo	oldval = &oldtup->colvalues[remoteattnum];
+			StringInfo	newval = &newtup->colvalues[remoteattnum];
+
+			if (oldval->len != newval->len ||
+				memcmp(oldval->data, newval->data, newval->len) != 0)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * YB: can the apply of an UPDATE/DELETE skip reading the local row and just
+ * write, addressing it by the key-derived ybctid?
+ *
+ * Nothing may need the row's current values: no secondary indexes (old index
+ * entries are keyed by old column values), no row triggers (old tuple), no
+ * check constraints (unsent columns), and no stored generated columns, which
+ * ExecComputeStoredGenerated would derive from a slot missing values.
+ *
+ * The planner asks the same question in yb_single_row_update_or_delete_path,
+ * but from a Path and a SET list, so none of it is reachable from a bare
+ * Relation - and of the four conditions it tests only check constraints.
+ *
+ * Whether the change itself needs the row is decided by
+ * YbReplUpdateNeedsLocalRow; DELETE passes false, having no new row to write.
+ */
+static bool
+YbApplyCanSkipLocalFetch(Relation localrel, bool needs_local_row)
+{
+	return !needs_local_row &&
+		!YBRelHasSecondaryIndices(localrel) &&
+		localrel->trigdesc == NULL &&
+		(localrel->rd_att->constr == NULL ||
+		 (localrel->rd_att->constr->num_check == 0 &&
+		  !localrel->rd_att->constr->has_generated_stored));
 }
 
 /*
@@ -1954,7 +2148,8 @@ apply_handle_update_internal(ApplyExecutionData *edata,
 
 	found = FindReplTupleInLocalRel(estate, localrel,
 									&relmapentry->remoterel,
-									remoteslot, &localslot);
+									remoteslot, &localslot,
+									edata->yb_needs_local_row);
 	ExecClearTuple(remoteslot);
 
 	/*
@@ -1968,6 +2163,11 @@ apply_handle_update_internal(ApplyExecutionData *edata,
 		oldctx = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 		slot_modify_data(remoteslot, localslot, relmapentry, newtup);
 		MemoryContextSwitchTo(oldctx);
+
+		/* For YB relations, convert virtual slot to heap slot for the executor. */
+		if (IsYBRelation(localrel))
+			remoteslot = CopyVirtualSlotToHeapSlot(estate, remoteslot,
+												   RelationGetDescr(localrel));
 
 		EvalPlanQualSetSlot(&epqstate, remoteslot);
 
@@ -2052,6 +2252,11 @@ apply_handle_delete(StringInfo s)
 	slot_store_data(remoteslot, rel, &oldtup);
 	MemoryContextSwitchTo(oldctx);
 
+	/* For YB relations, convert virtual slot to heap slot for the executor. */
+	if (IsYBRelation(rel->localrel))
+		remoteslot = CopyVirtualSlotToHeapSlot(estate, remoteslot,
+											   RelationGetDescr(rel->localrel));
+
 	/* For a partitioned table, apply delete to correct partition. */
 	if (rel->localrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
 		apply_handle_tuple_routing(edata,
@@ -2087,11 +2292,15 @@ apply_handle_delete_internal(ApplyExecutionData *edata,
 	TupleTableSlot *localslot;
 	bool		found;
 
+	/* YB declarations */
+	bool		yb_row_missing = false;
+
 	EvalPlanQualInit(&epqstate, estate, NULL, NIL, -1);
 	ExecOpenIndices(relinfo, false);
 
 	found = FindReplTupleInLocalRel(estate, localrel, remoterel,
-									remoteslot, &localslot);
+									remoteslot, &localslot,
+									false /* yb_needs_local_row */ );
 
 	/* If found delete it. */
 	if (found)
@@ -2100,9 +2309,17 @@ apply_handle_delete_internal(ApplyExecutionData *edata,
 
 		/* Do the actual delete. */
 		TargetPrivilegesCheck(relinfo->ri_RelationDesc, ACL_DELETE);
-		ExecSimpleRelationDelete(relinfo, estate, &epqstate, localslot);
+		ExecSimpleRelationDelete(relinfo, estate, &epqstate, localslot,
+								 &yb_row_missing);
 	}
-	else
+
+	/*
+	 * YB: the write-only path never reads, so a missing row shows up only in
+	 * the delete's rows-affected count.  That count costs a synchronous round
+	 * trip, so YbExecSimpleRelationDelete requests it only when this DEBUG1
+	 * report can be emitted; otherwise yb_row_missing stays false.
+	 */
+	if (!found || yb_row_missing)
 	{
 		/*
 		 * The tuple to be deleted could not be found.  Do nothing except for
@@ -2132,7 +2349,8 @@ static bool
 FindReplTupleInLocalRel(EState *estate, Relation localrel,
 						LogicalRepRelation *remoterel,
 						TupleTableSlot *remoteslot,
-						TupleTableSlot **localslot)
+						TupleTableSlot **localslot,
+						bool yb_needs_local_row)
 {
 	Oid			idxoid;
 	bool		found;
@@ -2142,6 +2360,60 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 	 * check for SELECT privileges.
 	 */
 	TargetPrivilegesCheck(localrel, ACL_SELECT);
+
+	/*
+	 * YB: for relations with a user-visible primary key, DocDB addresses the
+	 * row by a ybctid derived from the key columns in the replicated tuple,
+	 * so the local row can be located by a point read - or, when nothing
+	 * needs its current values, not read at all.  Relations without a user PK
+	 * fall through to the upstream lookups, which fill the slot's ybctid from
+	 * storage.
+	 *
+	 * The replicated tuple carries the replica identity columns, so this is
+	 * only sound when the identity actually in use is the primary key;
+	 * a relation whose identity is some other unique index must go through
+	 * the upstream lookup on that index (the PK columns may not have been
+	 * sent at all).  No test covers that: YB rejects ALTER TABLE ... REPLICA
+	 * IDENTITY USING INDEX (#1124), so rd_replidindex is never anything but
+	 * the primary key here, and the check is for when that changes.
+	 */
+	if (IsYBRelation(localrel) &&
+		!bms_is_empty(YBGetTablePrimaryKeyBms(localrel)) &&
+		GetRelationIdentityOrPK(localrel) ==
+		RelationGetPrimaryKeyIndex(localrel))
+	{
+		*localslot = ExecInitExtraTupleSlot(estate,
+											RelationGetDescr(localrel),
+											&TTSOpsHeapTuple);
+
+		/*
+		 * YB: write-only fast path.  Hand back a copy of the remote tuple as
+		 * the located row; ExecSimpleRelation* computes the row key from it.
+		 */
+		if (YbApplyCanSkipLocalFetch(localrel, yb_needs_local_row))
+		{
+			ExecCopySlot(*localslot, remoteslot);
+			slot_getallattrs(*localslot);
+			return true;
+		}
+
+		/*
+		 * YB: fetch the row by its key-derived ybctid.  A miss is a genuine
+		 * "row not found" and gets PG's skip-and-log semantics.
+		 */
+		{
+			Datum		ybctid = YBCComputeYBTupleIdFromSlot(localrel,
+															 remoteslot);
+			HeapTuple	tuple;
+
+			if (!YbFetchHeapTuple(localrel, ybctid, &tuple))
+				return false;
+
+			ExecStoreHeapTuple(tuple, *localslot, true);
+			slot_getallattrs(*localslot);
+			return true;
+		}
+	}
 
 	*localslot = table_slot_create(localrel, &estate->es_tupleTable);
 
@@ -2271,7 +2543,8 @@ apply_handle_tuple_routing(ApplyExecutionData *edata,
 				/* Get the matching local tuple from the partition. */
 				found = FindReplTupleInLocalRel(estate, partrel,
 												&part_entry->remoterel,
-												remoteslot_part, &localslot);
+												remoteslot_part, &localslot,
+												edata->yb_needs_local_row);
 				if (!found)
 				{
 					/*
@@ -2425,6 +2698,9 @@ apply_handle_truncate(StringInfo s)
 	ListCell   *lc;
 	LOCKMODE	lockmode = AccessExclusiveLock;
 
+	/* YB declarations */
+	bool		yb_separate_ddl_txn = false;
+
 	/*
 	 * Quick return if we are skipping data modification changes or handling
 	 * streamed transactions.
@@ -2504,16 +2780,58 @@ apply_handle_truncate(StringInfo s)
 	}
 
 	/*
-	 * Even if we used CASCADE on the upstream primary we explicitly default
-	 * to replaying changes without further cascading. This might be later
-	 * changeable with a user specified option.
+	 * YB: TRUNCATE is a DDL here - it drops and recreates the DocDB table - so
+	 * it has to run in DDL mode, which ProcessUtility would normally set up.
+	 * Apply calls ExecuteTruncateGuts directly and so must do it itself, using
+	 * the same choice ProcessUtility makes: join the surrounding transaction
+	 * where that is supported, otherwise run a separate DDL transaction.
+	 *
+	 * With a separate transaction the truncate commits on its own, so a
+	 * replicated transaction that mixes TRUNCATE with DML is no longer applied
+	 * atomically on the subscriber.
 	 */
-	ExecuteTruncateGuts(rels,
-						relids,
-						relids_logged,
-						DROP_RESTRICT,
-						restart_seqs,
-						false /* yb_is_top_level */ );
+	if (IsYugaByteEnabled())
+	{
+		yb_separate_ddl_txn = !YBIsDdlTransactionBlockEnabled();
+		if (yb_separate_ddl_txn)
+			YBIncrementDdlNestingLevel(YB_DDL_MODE_VERSION_INCREMENT);
+		else
+			YBAddDdlTxnState(YB_DDL_MODE_VERSION_INCREMENT);
+	}
+
+	PG_TRY();
+	{
+		/*
+		 * Even if we used CASCADE on the upstream primary we explicitly default
+		 * to replaying changes without further cascading. This might be later
+		 * changeable with a user specified option.
+		 */
+		ExecuteTruncateGuts(rels,
+							relids,
+							relids_logged,
+							DROP_RESTRICT,
+							restart_seqs,
+							false /* yb_is_top_level */ );
+
+		if (IsYugaByteEnabled())
+		{
+			if (yb_separate_ddl_txn)
+				YBDecrementDdlNestingLevel();
+			else
+				YBMergeDdlTxnState();
+		}
+	}
+	PG_CATCH();
+	{
+		/*
+		 * Reset rather than decrement: the nesting level can be wrong after an
+		 * error.  Matches how ProcessUtility recovers.
+		 */
+		if (yb_separate_ddl_txn)
+			YBResetDdlState();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 	foreach(lc, remote_rels)
 	{
 		LogicalRepRelMapEntry *rel = lfirst(lc);
@@ -3666,6 +3984,71 @@ start_apply(XLogRecPtr origin_startpos)
 	PG_END_TRY();
 }
 
+/*
+ * YB: detect whether the publisher on the other end of LogRepWorkerWalRcvConn
+ * is a YugabyteDB instance, and set yb_publisher_is_yb accordingly.  Values
+ * that are hybrid times on a YB publisher (the CREATE_REPLICATION_SLOT
+ * snapshot name, protocol commit times) are ordinary PG values on a
+ * PostgreSQL publisher and must not be reinterpreted.
+ */
+void
+yb_detect_publisher_type(void)
+{
+	WalRcvExecResult *res;
+	Oid			textoid = TEXTOID;
+
+	yb_publisher_is_yb = false;
+
+	if (!IsYugaByteEnabled())
+		return;
+
+	StartTransactionCommand();
+
+	res = walrcv_exec(LogRepWorkerWalRcvConn,
+					  "SELECT version()",
+					  1, &textoid);
+
+	if (res->status == WALRCV_OK_TUPLES)
+	{
+		TupleTableSlot *slot = MakeSingleTupleTableSlot(res->tupledesc,
+														&TTSOpsMinimalTuple);
+
+		if (tuplestore_gettupleslot(res->tuplestore, true, false, slot))
+		{
+			bool		isnull;
+			Datum		val = slot_getattr(slot, 1, &isnull);
+
+			if (!isnull)
+			{
+				char	   *version_str = TextDatumGetCString(val);
+
+				yb_publisher_is_yb = (strstr(version_str, "-YB-") != NULL);
+				pfree(version_str);
+			}
+		}
+		ExecDropSingleTupleTableSlot(slot);
+	}
+	else
+	{
+		/*
+		 * Do not fail the worker over a probe hiccup, but do not stay silent
+		 * either: consumers of yb_publisher_is_yb would misread hybrid-time
+		 * values from a YB publisher misdetected as PostgreSQL.
+		 */
+		ereport(WARNING,
+				(errmsg("could not detect publisher type, assuming PostgreSQL: %s",
+						res->err ? res->err : "unexpected result from SELECT version()")));
+	}
+
+	walrcv_clear_result(res);
+
+	CommitTransactionCommand();
+
+	ereport(LOG,
+			(errmsg("logical replication connected to %s publisher",
+					yb_publisher_is_yb ? "YugabyteDB" : "PostgreSQL")));
+}
+
 /* Logical Replication Apply worker entry point */
 void
 ApplyWorkerMain(Datum main_arg)
@@ -3888,6 +4271,9 @@ ApplyWorkerMain(Datum main_arg)
 		 * does some initializations on the upstream so let's still call it.
 		 */
 		(void) walrcv_identify_system(LogRepWorkerWalRcvConn, &startpointTLI);
+
+		/* YB: detect whether the publisher is YB or PG. */
+		yb_detect_publisher_type();
 
 		/*
 		 * Allocate the origin name in long-lived context for error context

@@ -26,6 +26,9 @@
 #include "replication/worker_internal.h"
 #include "utils/inval.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+
 
 static MemoryContext LogicalRepRelMapContext = NULL;
 
@@ -269,6 +272,16 @@ logicalrep_rel_mark_updatable(LogicalRepRelMapEntry *entry)
 	LogicalRepRelation *remoterel = &entry->remoterel;
 	int			i;
 
+	/*
+	 * YB: RelationGetIndexAttrBitmap indexes the bitmap from
+	 * YBGetFirstLowInvalidAttributeNumber for YB relations, so convert back
+	 * with the same base - otherwise every membership test below lands on the
+	 * neighbouring column and the relation is wrongly deemed not updatable.
+	 */
+	AttrNumber	yb_attr_offset = IsYugaByteEnabled() ?
+		YBGetFirstLowInvalidAttributeNumber(entry->localrel) :
+		FirstLowInvalidHeapAttributeNumber;
+
 	entry->updatable = true;
 
 	idkey = RelationGetIndexAttrBitmap(entry->localrel,
@@ -290,7 +303,7 @@ logicalrep_rel_mark_updatable(LogicalRepRelMapEntry *entry)
 	i = -1;
 	while ((i = bms_next_member(idkey, i)) >= 0)
 	{
-		int			attnum = i + FirstLowInvalidHeapAttributeNumber;
+		int			attnum = i + yb_attr_offset;
 
 		if (!AttrNumberIsForUserDefinedAttr(attnum))
 			ereport(ERROR,

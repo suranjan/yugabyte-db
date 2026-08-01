@@ -911,6 +911,7 @@ static char *restrict_nonsystem_relation_kind_string;
 
 bool		yb_enable_memory_tracking = true;
 bool		yb_enable_pg_subscription = false;
+bool		yb_pg_subscription_upsert_insert = true;
 static char *yb_effective_transaction_isolation_level_string;
 static char *yb_xcluster_consistency_level_string;
 static char *yb_read_time_string;
@@ -2758,6 +2759,21 @@ static struct config_bool ConfigureNamesBool[] =
 		},
 		&yb_enable_pg_subscription,
 		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_pg_subscription_upsert_insert", PGC_SIGHUP, REPLICATION_SUBSCRIBERS,
+			gettext_noop("Apply replicated INSERTs as upserts."),
+			gettext_noop("On by default so that replay of an already-applied "
+						 "change after a crash is idempotent.  Turning it off "
+						 "makes a conflicting INSERT raise a duplicate key "
+						 "error, which the apply worker retries forever unless "
+						 "the subscription has disable_on_error."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_pg_subscription_upsert_insert,
+		true,
 		NULL, NULL, NULL
 	},
 

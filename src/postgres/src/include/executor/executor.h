@@ -661,9 +661,15 @@ extern void ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 extern void ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 									 EState *estate, EPQState *epqstate,
 									 TupleTableSlot *searchslot, TupleTableSlot *slot);
+/*
+ * YB: yb_row_missing, when not NULL, is set if the row turned out not to exist.
+ * The write-only apply path reports the row as found without reading it, so
+ * that is only known once the write reports how many rows it affected.
+ */
 extern void ExecSimpleRelationDelete(ResultRelInfo *resultRelInfo,
 									 EState *estate, EPQState *epqstate,
-									 TupleTableSlot *searchslot);
+									 TupleTableSlot *searchslot,
+									 bool *yb_row_missing);
 extern void CheckCmdReplicaIdentity(Relation rel, CmdType cmd);
 
 extern void CheckSubscriptionRelkind(char relkind, const char *nspname,

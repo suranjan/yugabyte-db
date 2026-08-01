@@ -170,6 +170,7 @@ extern bool IsYugaByteEnabled();
 
 extern bool yb_enable_docdb_tracing;
 extern bool yb_enable_pg_subscription;
+extern bool yb_pg_subscription_upsert_insert;
 extern bool yb_enable_spi_dist_tracing;
 
 extern bool yb_read_from_followers;
@@ -1227,6 +1228,7 @@ extern void YBAddDdlTxnState(YbDdlMode mode);
 extern void YBAddDdlTxnStateExtended(YbDdlMode mode, bool block_ddl_concurrency_in_db);
 extern void YbLockDatabaseToBlockDdlConcurrency(YbDdlMode mode);
 extern void YBMergeDdlTxnState();
+extern void YBResetDdlState();
 extern void YBCommitTransactionContainingDDL();
 
 typedef struct YbDdlModeOptional
