@@ -322,14 +322,6 @@ RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode,
 
 	/* Start a heap scan. */
 	InitDirtySnapshot(snap);
-
-	/*
-	 * YB: the scan never runs the heap visibility checks that fill the dirty
-	 * snapshot's xmin/xmax, so clear them; stack garbage here would read as a
-	 * live locker and trigger a bogus XactLockTableWait.
-	 */
-	if (IsYBRelation(rel))
-		snap.xmin = snap.xmax = InvalidTransactionId;
 	scan = table_beginscan(rel, &snap, 0, NULL);
 	scanslot = table_slot_create(rel, NULL);
 
@@ -346,6 +338,13 @@ retry:
 
 		found = true;
 		ExecCopySlot(outslot, scanslot);
+
+		/*
+		 * YB: nothing fills the dirty snapshot, so there is no locker to wait
+		 * for; same as check_exclusion_or_unique_constraint's YB branch.
+		 */
+		if (IsYBRelation(rel))
+			break;
 
 		xwait = TransactionIdIsValid(snap.xmin) ?
 			snap.xmin : snap.xmax;
