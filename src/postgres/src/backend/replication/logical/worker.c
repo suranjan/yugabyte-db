@@ -2366,10 +2366,10 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 	 * read - or not read at all.  Relations without a user PK fall through to
 	 * the upstream lookups, which fill the slot's ybctid from storage.
 	 *
-	 * Only sound when the identity in use is the primary key: another unique
-	 * index must use the upstream lookup, since the PK columns may not have been
-	 * sent.  Untested, because YB rejects REPLICA IDENTITY USING INDEX (#1124) -
-	 * the check is for when that changes.
+	 * Only sound when the identity in use is the primary key, since with another
+	 * unique index the PK columns may not have been sent at all.  That cannot
+	 * happen while YB rejects REPLICA IDENTITY USING INDEX (#1124), and the
+	 * lookup below refuses it rather than guess.
 	 */
 	if (IsYBRelation(localrel) &&
 		!bms_is_empty(YBGetTablePrimaryKeyBms(localrel)) &&
@@ -2415,6 +2415,21 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 	idxoid = GetRelationIdentityOrPK(localrel);
 	Assert(OidIsValid(idxoid) ||
 		   (remoterel->replident == REPLICA_IDENTITY_FULL));
+
+	/*
+	 * YB: a valid index here means a YB relation whose replica identity is not
+	 * its primary key - the branch above took every one whose identity is.  YB
+	 * rejects REPLICA IDENTITY USING INDEX (#1124), so that cannot be reached;
+	 * refuse it rather than run the upstream index lookup, which addresses rows
+	 * by ctid.  Supporting #1124 means making that lookup work for DocDB.
+	 */
+	if (IsYBRelation(localrel) && OidIsValid(idxoid))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot apply replicated change to relation \"%s\"",
+						RelationGetRelationName(localrel)),
+				 errdetail("Its replica identity is an index other than the "
+						   "primary key.")));
 
 	if (OidIsValid(idxoid))
 		found = RelationFindReplTupleByIndex(localrel, idxoid,

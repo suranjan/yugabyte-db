@@ -140,16 +140,6 @@ RelationFindReplTupleByIndex(Relation rel, Oid idxoid,
 
 	/* Start an index scan. */
 	InitDirtySnapshot(snap);
-
-	/*
-	 * YB: the scan never runs the heap visibility checks that fill the dirty
-	 * snapshot's xmin/xmax, so clear them; stack garbage would read as a live
-	 * locker and trigger a bogus XactLockTableWait.  This and the tuple-lock
-	 * skip below are repeated verbatim in RelationFindReplTupleSeq on purpose -
-	 * textual parallelism with upstream is what lets future merges apply.
-	 */
-	if (IsYBRelation(rel))
-		snap.xmin = snap.xmax = InvalidTransactionId;
 	scan = index_beginscan(rel, idxrel, &snap,
 						   IndexRelationGetNumberOfKeyAttributes(idxrel),
 						   0);
@@ -182,12 +172,8 @@ retry:
 		}
 	}
 
-	/*
-	 * Found tuple; lock it unless this is a YB relation.  YB slots carry the
-	 * row already and identify it by ybctid, while table_tuple_lock expects a
-	 * buffer heap tuple addressed by ctid.
-	 */
-	if (found && !IsYBRelation(rel))
+	/* Found tuple, try to lock it in the lockmode. */
+	if (found)
 	{
 		TM_FailureData tmfd;
 		TM_Result	res;
