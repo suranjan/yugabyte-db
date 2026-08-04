@@ -2011,29 +2011,20 @@ CopyVirtualSlotToHeapSlot(EState *estate, TupleTableSlot *virtualslot,
 /*
  * YB: must this UPDATE read the local row, or can it write blind?
  *
- * A blind write is safe because YBCExecuteUpdate stores only the columns in
- * updatedCols, so a column this change does not supply keeps its stored value
- * without ever being read.  Only such a column forces a read, being NULL in the
- * slot, and three things expose that:
+ * Only an unsupplied column forces a read: YBCExecuteUpdate stores only
+ * updatedCols, so such a column keeps its stored value unread - but it is NULL
+ * in the slot, which three things then expose.  A key change becomes a delete
+ * plus insert that stores the whole slot, persisting that NULL.  ExecConstraints
+ * rejects an unsupplied NOT NULL column even though the write would skip it (its
+ * yb_skip_unmodified narrowing would cover this, but only for NOT NULL, and
+ * apply passes no ModifyTableState to reach it).  And a partitioned target is
+ * taken conservatively, since NOT NULL is judged here from the root while a
+ * partition may be stricter; whatever else a leaf needs - its indexes, triggers,
+ * check constraints, stored generated columns - YbApplyCanSkipLocalFetch retests
+ * against the leaf itself.
  *
- * A key change.  It is applied as delete plus insert
- * (YBCExecuteUpdateReplace), and that insert stores every column of the slot,
- * so an unsupplied column - NULL in the slot - would be persisted as NULL.  The
- * publisher sends an old tuple only when the replica identity columns changed
- * or the identity is FULL, so with no old tuple the key is unchanged; otherwise
- * the keys are compared.  Comparing the replicated values rather than the
- * stored ones is what lets this be decided before the lookup, and it errs in
- * the safe direction: identical bytes are certainly the same value, while a
- * spurious difference only costs a read.
- *
- * An unsupplied NOT NULL column.  The write skips it, but ExecSimpleRelationUpdate
- * validates the whole slot, and ExecConstraints rejects the NULL even though
- * that column was never going to be written.
- *
- * A partitioned target is taken conservatively: NOT NULL is judged here from the
- * root, and a partition may be stricter.  Whatever else a leaf needs - its
- * indexes, triggers, check constraints, stored generated columns -
- * YbApplyCanSkipLocalFetch retests against the leaf itself.
+ * Keys are compared as replicated values, not stored ones, so this is decided
+ * before the lookup; that errs safe, a spurious difference only costing a read.
  */
 static bool
 YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel, bool has_oldtup,
@@ -2102,26 +2093,17 @@ YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel, bool has_oldtup,
  * YB: can the apply of an UPDATE/DELETE skip reading the local row and just
  * write, addressing it by the key-derived ybctid?
  *
- * Nothing may need the row's current values: no secondary indexes (old index
- * entries are keyed by old column values), no triggers needing the old tuple
- * for this operation, no check constraints (unsent columns), and no stored
- * generated columns, which ExecComputeStoredGenerated would derive from a slot
- * missing values.
+ * Nothing may need the row's current values: no secondary indexes (old entries
+ * are keyed by old values), no triggers needing the old tuple for this
+ * operation, no check constraints or stored generated columns (unsent columns).
+ * Whether the change itself needs the row is YbReplUpdateNeedsLocalRow's call;
+ * DELETE passes false, having no new row to write.
  *
- * The planner asks the same question in yb_single_row_update_or_delete_path,
- * but from a Path and a SET list, so none of it is reachable from a bare
- * Relation - and of the four conditions it tests only check constraints.
- *
- * Whether the change itself needs the row is decided by
- * YbReplUpdateNeedsLocalRow; DELETE passes false, having no new row to write.
- *
- * The skip also costs the caller's DEBUG1 missing-row report, since a write
- * that addresses a row by key cannot tell that the row was absent.  DELETE
- * recovers it from the delete's rows-affected count, but for UPDATE that count
- * is unavailable: apply passes canSetTag false with no RETURNING clause, so
- * YBCExecuteUpdate always takes its batched path and never asks DocDB for one.
- * So when the report can actually be emitted, read the row instead and let the
- * lookup answer it.
+ * Skipping also costs the caller's DEBUG1 missing-row report, since a keyed
+ * write cannot tell the row was absent.  DELETE recovers that from its
+ * rows-affected count; UPDATE cannot, because apply passes canSetTag false with
+ * no RETURNING clause, so YBCExecuteUpdate always batches and never asks for
+ * one.  So give up the skip while that report is reachable.
  */
 static bool
 YbApplyCanSkipLocalFetch(Relation localrel, bool needs_local_row,
@@ -2379,20 +2361,15 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 	TargetPrivilegesCheck(localrel, ACL_SELECT);
 
 	/*
-	 * YB: for relations with a user-visible primary key, DocDB addresses the
-	 * row by a ybctid derived from the key columns in the replicated tuple,
-	 * so the local row can be located by a point read - or, when nothing
-	 * needs its current values, not read at all.  Relations without a user PK
-	 * fall through to the upstream lookups, which fill the slot's ybctid from
-	 * storage.
+	 * YB: with a user-visible primary key the row is addressed by a ybctid
+	 * derived from the replicated key columns, so it can be located by a point
+	 * read - or not read at all.  Relations without a user PK fall through to
+	 * the upstream lookups, which fill the slot's ybctid from storage.
 	 *
-	 * The replicated tuple carries the replica identity columns, so this is
-	 * only sound when the identity actually in use is the primary key;
-	 * a relation whose identity is some other unique index must go through
-	 * the upstream lookup on that index (the PK columns may not have been
-	 * sent at all).  No test covers that: YB rejects ALTER TABLE ... REPLICA
-	 * IDENTITY USING INDEX (#1124), so rd_replidindex is never anything but
-	 * the primary key here, and the check is for when that changes.
+	 * Only sound when the identity in use is the primary key: another unique
+	 * index must use the upstream lookup, since the PK columns may not have been
+	 * sent.  Untested, because YB rejects REPLICA IDENTITY USING INDEX (#1124) -
+	 * the check is for when that changes.
 	 */
 	if (IsYBRelation(localrel) &&
 		!bms_is_empty(YBGetTablePrimaryKeyBms(localrel)) &&
@@ -2799,15 +2776,9 @@ apply_handle_truncate(StringInfo s)
 	}
 
 	/*
-	 * YB: TRUNCATE is a DDL here - it drops and recreates the DocDB table - so
-	 * it has to run in DDL mode, which ProcessUtility would normally set up.
-	 * Apply calls ExecuteTruncateGuts directly and so must do it itself, using
-	 * the same choice ProcessUtility makes: join the surrounding transaction
-	 * where that is supported, otherwise run a separate DDL transaction.
-	 *
-	 * With a separate transaction the truncate commits on its own, so a
-	 * replicated transaction that mixes TRUNCATE with DML is no longer applied
-	 * atomically on the subscriber.
+	 * YB: TRUNCATE is a DDL here, so join the surrounding transaction when that
+	 * is supported, otherwise run a separate DDL transaction - in which case
+	 * TRUNCATE mixed with DML no longer applies atomically.
 	 */
 	if (IsYugaByteEnabled())
 	{

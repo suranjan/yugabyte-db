@@ -559,15 +559,11 @@ YbExecSimpleRelationInsert(ResultRelInfo *resultRelInfo, EState *estate,
 	slot->tts_tableOid = RelationGetRelid(rel);
 
 	/*
-	 * YB: upsert, so that a change already committed before a crash replays
-	 * idempotently - origin progress is only flushed at checkpoints, so that
-	 * replay window is real.
-	 *
-	 * Only where a blind write is safe: YBIsUpsertUnsafeOnRel is the tree's own
-	 * rule (stale index entries, INSERT triggers firing for an UPDATE, skipped
-	 * FK cascades), and COPY REPLACE errors out rather than proceed there.
-	 * Elsewhere a colliding insert reports the duplicate key, which is what
-	 * makes a genuine divergence visible.
+	 * YB: upsert so a change committed before a crash replays idempotently -
+	 * origin progress is only flushed at checkpoints, so that window is real.
+	 * Only where a blind write is safe (YBIsUpsertUnsafeOnRel is the tree's own
+	 * rule); elsewhere a colliding insert reports the duplicate key, which is
+	 * what makes a genuine divergence visible.
 	 */
 	YBCExecuteInsert(rel, slot,
 					 (yb_pg_subscription_upsert_insert &&
@@ -595,11 +591,10 @@ static const ModifyTable yb_repl_mt_plan = {
 /*
  * YB: the columns YBCExecuteUpdate may write for a replicated UPDATE.  Key
  * columns are excluded - bound via ybctid, and YBCExecuteUpdate asserts
- * updatedCols names none, a key change having gone to YBCExecuteUpdateReplace.
- * whole_row is the trigger / stored-generated case; spelling the set out beats
- * the InvalidAttrNumber sentinel, which would bind every column including the
- * key.  updatedCols must already be in rel's attribute numbers - a routed
- * partition's bitmap is translated from the root first.
+ * updatedCols names none.  whole_row is the trigger / stored-generated case;
+ * spelling the set out beats the InvalidAttrNumber sentinel, which would bind
+ * every column including the key.  updatedCols must already be in rel's
+ * attribute numbers.
  */
 static Bitmapset *
 YbReplUpdatedCols(Relation rel, Bitmapset *updatedCols, bool whole_row)
@@ -729,12 +724,10 @@ YbExecSimpleRelationDelete(ResultRelInfo *resultRelInfo, EState *estate,
 	searchslot->tts_tableOid = RelationGetRelid(rel);
 
 	/*
-	 * YB: DocDB is asked for a rows-affected count only when the tuple was not
-	 * fetched, which is exactly when the return value carries information.  That
-	 * count is not free - pggate flushes the operation buffer to get it, a
-	 * synchronous round trip per change - and it feeds only the caller's DEBUG1
-	 * missing-row report.  So when that report cannot be emitted, derive the
-	 * ybctid here and present the tuple as fetched, keeping the delete batched.
+	 * YB: the rows-affected count costs a synchronous flush per change and feeds
+	 * only the caller's DEBUG1 missing-row report.  So when that report cannot be
+	 * emitted, derive the ybctid and present the tuple as fetched, which keeps
+	 * the delete batched and stops the count being requested.
 	 */
 	if (TABLETUPLE_YBCTID(searchslot) == 0 &&
 		!message_level_is_interesting(DEBUG1))
