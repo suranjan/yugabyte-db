@@ -19,6 +19,7 @@ import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 
@@ -27,6 +28,8 @@ import org.junit.Before;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.client.TestUtils;
+import org.yb.minicluster.LogErrorListener;
+import org.yb.minicluster.MiniYBDaemon;
 import org.yb.util.BuildTypeUtil;
 
 /**
@@ -247,7 +250,40 @@ public abstract class BasePgSubscriptionApplyTest extends BasePgSQLTest {
     }
   }
 
-  /** Fetches all rows from a query as lists of strings. */
+  /**
+   * Collect apply worker log lines containing 'needle'.
+   *
+   * The apply worker logs to the tserver's stderr, which the harness is already
+   * tailing, so attach to that rather than locating the log file.  Registered
+   * per test because the cluster is recreated for each one.
+   */
+  protected List<String> collectPgLogLines(String needle) throws Exception {
+    List<String> matched = Collections.synchronizedList(new ArrayList<>());
+
+    for (MiniYBDaemon tserver : miniCluster.getTabletServers().values()) {
+      tserver.getLogPrinter().addErrorListener(new LogErrorListener() {
+        @Override
+        public void handleLine(String line) {
+          if (line.contains(needle))
+            matched.add(line);
+        }
+
+        @Override
+        public void reportErrorsAtEnd() {
+          // Nothing: the lines are the result, not a failure.
+        }
+      });
+    }
+    return matched;
+  }
+
+  /** Waits until a line collected by collectPgLogLines shows up. */
+  protected void waitForLogLine(List<String> collected, String what) throws Exception {
+    TestUtils.waitFor(() -> !collected.isEmpty(),
+                      REPLICATION_TIMEOUT_MS, REPLICATION_POLL_INTERVAL_MS);
+    assertTrue("Expected " + what + " in the apply worker log", !collected.isEmpty());
+  }
+
   /**
    * Wait until the subscription has recorded at least one apply failure.
    *
@@ -265,6 +301,7 @@ public abstract class BasePgSubscriptionApplyTest extends BasePgSQLTest {
     }, REPLICATION_TIMEOUT_MS, REPLICATION_POLL_INTERVAL_MS);
   }
 
+  /** Fetches all rows from a query as lists of strings. */
   protected List<List<String>> fetchRows(Connection conn, String query) throws Exception {
     List<List<String>> rows = new ArrayList<>();
     try (Statement stmt = conn.createStatement();

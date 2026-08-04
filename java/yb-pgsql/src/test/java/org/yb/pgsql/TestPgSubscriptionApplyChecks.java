@@ -15,6 +15,7 @@ package org.yb.pgsql;
 import static org.yb.AssertionWrappers.assertEquals;
 import java.sql.Statement;
 import java.util.Arrays;
+import java.util.List;
 
 import org.junit.Test;
 import org.junit.runner.RunWith;
@@ -128,6 +129,82 @@ public class TestPgSubscriptionApplyChecks extends BasePgSubscriptionApplyTest {
 
     assertEquals(Arrays.asList(row("1", "seed")),
                  fetchRows(subConn, "SELECT id, val FROM t"));
+  }
+
+  /**
+   * The missing-row report has to survive the write-only fast path for UPDATE
+   * too, not just for DELETE.  Nothing about this table needs the local row -
+   * no index, no trigger, no constraint - so the apply would otherwise answer
+   * "found" without reading and report nothing at all.
+   *
+   * Unlike DELETE, UPDATE cannot recover the answer after the fact: apply
+   * passes canSetTag false with no RETURNING clause, so YBCExecuteUpdate always
+   * batches and never asks DocDB for a rows-affected count.  So the fast path
+   * is given up while this report is reachable, and that is what this asserts.
+   */
+  @Test
+  public void testUpdateOfMissingRowIsReportedWithDebugLogging() throws Exception {
+    try (Statement stmt = subConn.createStatement()) {
+      stmt.execute("ALTER DATABASE " + SUB_DB + " SET log_min_messages = 'debug1'");
+    }
+    createReplicatedTable("t", stmt -> {
+      stmt.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)");
+    });
+
+    List<String> reports =
+        collectPgLogLines("logical replication did not find row to be updated");
+
+    execOnPublisher("INSERT INTO t VALUES (1, 'seed'), (2, 'gone')");
+    waitForRowCount("t", 2);
+
+    // Diverge: the row the publisher is about to update is not here.
+    try (Statement stmt = subConn.createStatement()) {
+      stmt.execute("DELETE FROM t WHERE id = 2");
+    }
+
+    execOnPublisher("UPDATE t SET val = 'updated' WHERE id = 2");
+    waitForLogLine(reports, "the missing-row report for UPDATE");
+
+    // The update of the absent row is a no-op, and the stream keeps flowing.
+    execOnPublisher("INSERT INTO t VALUES (3, 'sentinel')");
+    waitForRows("SELECT id, val FROM t ORDER BY id",
+                Arrays.asList(row("1", "seed"), row("3", "sentinel")));
+  }
+
+  /**
+   * A relation whose only trigger fires on INSERT needs nothing from the old
+   * row when an UPDATE or a DELETE is applied, so both still take the
+   * write-only path.  The predicate is asked per operation rather than "does
+   * this relation have any trigger at all", and this is the case that
+   * distinguishes the two.
+   */
+  @Test
+  public void testApplyOnTableWithInsertOnlyTrigger() throws Exception {
+    createReplicatedTable("t", stmt -> {
+      stmt.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)");
+      stmt.execute("CREATE TABLE t_audit (id INT, val TEXT)");
+      // Schema-qualified: the apply worker runs with an empty search_path, so an
+      // unqualified name in the trigger body would not resolve.
+      stmt.execute("CREATE FUNCTION t_audit_fn() RETURNS TRIGGER AS $$ "
+                   + "BEGIN INSERT INTO public.t_audit VALUES (NEW.id, NEW.val); "
+                   + "RETURN NEW; END; $$ LANGUAGE plpgsql");
+      stmt.execute("CREATE TRIGGER t_ins AFTER INSERT ON t "
+                   + "FOR EACH ROW EXECUTE FUNCTION t_audit_fn()");
+      // Replicated writes only fire triggers on a subscriber that enables them.
+      stmt.execute("ALTER TABLE t ENABLE ALWAYS TRIGGER t_ins");
+    });
+
+    execOnPublisher("INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+    waitForRows("SELECT id, val FROM t ORDER BY id",
+                Arrays.asList(row("1", "a"), row("2", "b")));
+
+    execOnPublisher("UPDATE t SET val = 'a2' WHERE id = 1");
+    execOnPublisher("DELETE FROM t WHERE id = 2");
+    waitForRows("SELECT id, val FROM t ORDER BY id", Arrays.asList(row("1", "a2")));
+
+    // The INSERT trigger fired for the two inserts, and for nothing else.
+    assertEquals(Arrays.asList(row("1", "a"), row("2", "b")),
+                 fetchRows(subConn, "SELECT id, val FROM t_audit ORDER BY id"));
   }
 
   /**

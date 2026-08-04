@@ -372,7 +372,8 @@ static bool FindReplTupleInLocalRel(EState *estate, Relation localrel,
 									LogicalRepRelation *remoterel,
 									TupleTableSlot *remoteslot,
 									TupleTableSlot **localslot,
-									bool yb_needs_local_row);
+									bool yb_needs_local_row,
+									CmdType yb_operation);
 static bool YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel,
 									  bool has_oldtup,
 									  LogicalRepTupleData *oldtup,
@@ -2102,9 +2103,10 @@ YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel, bool has_oldtup,
  * write, addressing it by the key-derived ybctid?
  *
  * Nothing may need the row's current values: no secondary indexes (old index
- * entries are keyed by old column values), no row triggers (old tuple), no
- * check constraints (unsent columns), and no stored generated columns, which
- * ExecComputeStoredGenerated would derive from a slot missing values.
+ * entries are keyed by old column values), no triggers needing the old tuple
+ * for this operation, no check constraints (unsent columns), and no stored
+ * generated columns, which ExecComputeStoredGenerated would derive from a slot
+ * missing values.
  *
  * The planner asks the same question in yb_single_row_update_or_delete_path,
  * but from a Path and a SET list, so none of it is reachable from a bare
@@ -2112,13 +2114,25 @@ YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel, bool has_oldtup,
  *
  * Whether the change itself needs the row is decided by
  * YbReplUpdateNeedsLocalRow; DELETE passes false, having no new row to write.
+ *
+ * The skip also costs the caller's DEBUG1 missing-row report, since a write
+ * that addresses a row by key cannot tell that the row was absent.  DELETE
+ * recovers it from the delete's rows-affected count, but for UPDATE that count
+ * is unavailable: apply passes canSetTag false with no RETURNING clause, so
+ * YBCExecuteUpdate always takes its batched path and never asks DocDB for one.
+ * So when the report can actually be emitted, read the row instead and let the
+ * lookup answer it.
  */
 static bool
-YbApplyCanSkipLocalFetch(Relation localrel, bool needs_local_row)
+YbApplyCanSkipLocalFetch(Relation localrel, bool needs_local_row,
+						 CmdType operation)
 {
+	if (operation == CMD_UPDATE && message_level_is_interesting(DEBUG1))
+		return false;
+
 	return !needs_local_row &&
 		!YBRelHasSecondaryIndices(localrel) &&
-		localrel->trigdesc == NULL &&
+		!YBRelHasOldRowTriggers(localrel, operation) &&
 		(localrel->rd_att->constr == NULL ||
 		 (localrel->rd_att->constr->num_check == 0 &&
 		  !localrel->rd_att->constr->has_generated_stored));
@@ -2149,7 +2163,8 @@ apply_handle_update_internal(ApplyExecutionData *edata,
 	found = FindReplTupleInLocalRel(estate, localrel,
 									&relmapentry->remoterel,
 									remoteslot, &localslot,
-									edata->yb_needs_local_row);
+									edata->yb_needs_local_row,
+									CMD_UPDATE);
 	ExecClearTuple(remoteslot);
 
 	/*
@@ -2300,7 +2315,8 @@ apply_handle_delete_internal(ApplyExecutionData *edata,
 
 	found = FindReplTupleInLocalRel(estate, localrel, remoterel,
 									remoteslot, &localslot,
-									false /* yb_needs_local_row */ );
+									false /* yb_needs_local_row */ ,
+									CMD_DELETE);
 
 	/* If found delete it. */
 	if (found)
@@ -2350,7 +2366,8 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 						LogicalRepRelation *remoterel,
 						TupleTableSlot *remoteslot,
 						TupleTableSlot **localslot,
-						bool yb_needs_local_row)
+						bool yb_needs_local_row,
+						CmdType yb_operation)
 {
 	Oid			idxoid;
 	bool		found;
@@ -2390,7 +2407,8 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 		 * YB: write-only fast path.  Hand back a copy of the remote tuple as
 		 * the located row; ExecSimpleRelation* computes the row key from it.
 		 */
-		if (YbApplyCanSkipLocalFetch(localrel, yb_needs_local_row))
+		if (YbApplyCanSkipLocalFetch(localrel, yb_needs_local_row,
+									 yb_operation))
 		{
 			ExecCopySlot(*localslot, remoteslot);
 			slot_getallattrs(*localslot);
@@ -2544,7 +2562,8 @@ apply_handle_tuple_routing(ApplyExecutionData *edata,
 				found = FindReplTupleInLocalRel(estate, partrel,
 												&part_entry->remoterel,
 												remoteslot_part, &localslot,
-												edata->yb_needs_local_row);
+												edata->yb_needs_local_row,
+												operation);
 				if (!found)
 				{
 					/*
