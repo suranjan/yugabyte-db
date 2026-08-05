@@ -4001,6 +4001,9 @@ yb_detect_publisher_type(void)
 {
 	WalRcvExecResult *res;
 	Oid			textoid = TEXTOID;
+	TupleTableSlot *slot;
+	bool		isnull;
+	char	   *version_str;
 
 	yb_publisher_is_yb = false;
 
@@ -4013,38 +4016,29 @@ yb_detect_publisher_type(void)
 					  "SELECT version()",
 					  1, &textoid);
 
-	if (res->status == WALRCV_OK_TUPLES)
-	{
-		TupleTableSlot *slot = MakeSingleTupleTableSlot(res->tupledesc,
-														&TTSOpsMinimalTuple);
+	/*
+	 * Refuse rather than guess: a YB publisher taken for PostgreSQL has its
+	 * hybrid times read as ordinary values, and that failure is silent.  This
+	 * exits the worker, which the launcher then retries, exactly as it does for
+	 * the failed connection its caller reports.
+	 */
+	if (res->status != WALRCV_OK_TUPLES)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("could not fetch version from publisher: %s", res->err)));
 
-		if (tuplestore_gettupleslot(res->tuplestore, true, false, slot))
-		{
-			bool		isnull;
-			Datum		val = slot_getattr(slot, 1, &isnull);
+	slot = MakeSingleTupleTableSlot(res->tupledesc, &TTSOpsMinimalTuple);
+	if (!tuplestore_gettupleslot(res->tuplestore, true, false, slot))
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("publisher returned no version")));
 
-			if (!isnull)
-			{
-				char	   *version_str = TextDatumGetCString(val);
+	version_str = TextDatumGetCString(slot_getattr(slot, 1, &isnull));
+	Assert(!isnull);
+	yb_publisher_is_yb = (strstr(version_str, "-YB-") != NULL);
+	pfree(version_str);
 
-				yb_publisher_is_yb = (strstr(version_str, "-YB-") != NULL);
-				pfree(version_str);
-			}
-		}
-		ExecDropSingleTupleTableSlot(slot);
-	}
-	else
-	{
-		/*
-		 * Do not fail the worker over a probe hiccup, but do not stay silent
-		 * either: consumers of yb_publisher_is_yb would misread hybrid-time
-		 * values from a YB publisher misdetected as PostgreSQL.
-		 */
-		ereport(WARNING,
-				(errmsg("could not detect publisher type, assuming PostgreSQL: %s",
-						res->err ? res->err : "unexpected result from SELECT version()")));
-	}
-
+	ExecDropSingleTupleTableSlot(slot);
 	walrcv_clear_result(res);
 
 	CommitTransactionCommand();
