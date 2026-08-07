@@ -69,6 +69,14 @@ typedef struct LogicalRepWorker
 
 	/* YB fields */
 	bool		yb_owns_subscription;	/* apply worker holds the sub's lock */
+
+	/*
+	 * Apply progress as a hybrid time, for a YugabyteDB publisher only.
+	 * The LSN stats above are virtual-WAL positions, which say nothing about
+	 * how far the tablesync state machine has got - it decides on hybrid
+	 * times.  Stays 0 against a PostgreSQL publisher.
+	 */
+	XLogRecPtr	yb_last_commit_ht;
 } LogicalRepWorker;
 
 /* Main memory context for apply worker. Permanent during worker lifetime. */

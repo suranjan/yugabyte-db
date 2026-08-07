@@ -986,7 +986,8 @@ IsLogicalLauncher(void)
 Datum
 pg_stat_get_subscription(PG_FUNCTION_ARGS)
 {
-#define PG_STAT_GET_SUBSCRIPTION_COLS	8
+/* YB: 8 upstream columns plus yb_last_commit_ht. */
+#define PG_STAT_GET_SUBSCRIPTION_COLS	9
 	Oid			subid = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
 	int			i;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
@@ -1043,6 +1044,15 @@ pg_stat_get_subscription(PG_FUNCTION_ARGS)
 			nulls[7] = true;
 		else
 			values[7] = TimestampTzGetDatum(worker.reply_time);
+
+		/*
+		 * YB: only a YugabyteDB publisher reports hybrid times, so this stays
+		 * unset - and therefore NULL - against a PostgreSQL one.
+		 */
+		if (XLogRecPtrIsInvalid(worker.yb_last_commit_ht))
+			nulls[8] = true;
+		else
+			values[8] = Int64GetDatum((int64) worker.yb_last_commit_ht);
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
 							 values, nulls);

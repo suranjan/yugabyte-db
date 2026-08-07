@@ -13,6 +13,9 @@
 package org.yb.pgsql;
 
 import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.assertNotNull;
+import static org.yb.AssertionWrappers.assertTrue;
+import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.Arrays;
 import java.util.List;
@@ -20,6 +23,7 @@ import java.util.List;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.yb.YBTestRunner;
+import org.yb.client.TestUtils;
 
 /**
  * End-to-end tests for YugabyteDB logical replication (pg_subscription).
@@ -341,5 +345,69 @@ public class TestPgSubscription extends BasePgSubscriptionApplyTest {
     execOnPublisher("INSERT INTO t VALUES (3, 'sentinel')");
     waitForRows("SELECT id, val FROM t ORDER BY id",
                 Arrays.asList(row("1", "keep"), row("3", "sentinel")));
+  }
+
+  // ----- Group 9: Apply progress reporting -----
+
+  /**
+   * The applied hybrid time must be readable on the subscriber, and must keep
+   * advancing while the publisher is idle.  Together those are what let a caller
+   * build a catch-up barrier against a YB publisher: pg_current_wal_lsn() is
+   * unsupported here, so the only way to ask whether everything committed by now
+   * has been applied is to compare this against a publisher-side
+   * yb_get_current_hybrid_time_lsn().
+   */
+  @Test
+  public void testApplyProgressHybridTimeIsReported() throws Exception {
+    createReplicatedTable("t", stmt -> {
+      stmt.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)");
+    });
+
+    long beforeInsert = publisherHybridTime();
+    execOnPublisher("INSERT INTO t VALUES (1, 'first')");
+    waitForRows("SELECT id, val FROM t", Arrays.asList(row("1", "first")));
+
+    // Waited rather than asserted outright: the row becomes visible when the
+    // apply transaction commits, a moment before progress is published.
+    waitForAppliedHybridTimePast(beforeInsert);
+
+    // Now with no DML at all.  Only keepalives carrying the VWAL safe_time can
+    // move this on, which is the case a barrier depends on when the publisher is
+    // quiet - and the one that would silently never fire if safe_time stopped
+    // reaching the worker.
+    waitForAppliedHybridTimePast(publisherHybridTime());
+
+    assertNotNull("yb_last_commit_ht must be set for a YB publisher",
+                  appliedHybridTime());
+  }
+
+  /** Wall clock of the publisher node, as a hybrid time. */
+  private long publisherHybridTime() throws Exception {
+    try (Statement stmt = pubConn.createStatement();
+         ResultSet rs = stmt.executeQuery("SELECT yb_get_current_hybrid_time_lsn()")) {
+      assertTrue("yb_get_current_hybrid_time_lsn() returned no row", rs.next());
+      return rs.getLong(1);
+    }
+  }
+
+  /** null when no apply worker is running, or the publisher is not YugabyteDB. */
+  private Long appliedHybridTime() throws Exception {
+    try (Statement stmt = subConn.createStatement();
+         ResultSet rs = stmt.executeQuery(
+             "SELECT yb_last_commit_ht FROM pg_stat_subscription "
+             + "WHERE subname = 'test_sub'")) {
+      if (!rs.next()) {
+        return null;
+      }
+      long value = rs.getLong(1);
+      return rs.wasNull() ? null : value;
+    }
+  }
+
+  private void waitForAppliedHybridTimePast(long target) throws Exception {
+    TestUtils.waitFor(() -> {
+      Long applied = appliedHybridTime();
+      return applied != null && applied > target;
+    }, TIMEOUT_MS, POLL_INTERVAL_MS);
   }
 }

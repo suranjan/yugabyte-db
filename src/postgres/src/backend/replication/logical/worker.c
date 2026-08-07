@@ -360,6 +360,8 @@ static void store_flush_position(XLogRecPtr remote_lsn);
 
 static void maybe_reread_subscription(void);
 
+static void yb_set_last_commit_ht(XLogRecPtr ht);
+
 static void DisableSubscriptionAndExit(void);
 
 /* prototype needed because of stream_commit */
@@ -1683,7 +1685,7 @@ apply_handle_commit_internal(LogicalRepCommitData *commit_data)
 		CommitTransactionCommand();
 
 		if (yb_publisher_is_yb)
-			yb_last_commit_ht = (XLogRecPtr) commit_data->committime;
+			yb_set_last_commit_ht((XLogRecPtr) commit_data->committime);
 
 		pgstat_report_stat(false);
 
@@ -2965,6 +2967,20 @@ UpdateWorkerStats(XLogRecPtr last_lsn, TimestampTz send_time, bool reply)
 }
 
 /*
+ * YB: Record apply progress, and publish it for pg_stat_subscription.
+ *
+ * Kept in one place because the shared-memory copy is the only thing that makes
+ * progress against a YugabyteDB publisher observable: the LSN stats are virtual
+ * WAL positions, and the replication origin stores one of those too.
+ */
+static void
+yb_set_last_commit_ht(XLogRecPtr ht)
+{
+	yb_last_commit_ht = ht;
+	MyLogicalRepWorker->yb_last_commit_ht = ht;
+}
+
+/*
  * Apply main loop.
  */
 static void
@@ -3032,7 +3048,7 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 	if (yb_publisher_is_yb)
 	{
 		if (last_received > ((XLogRecPtr) 1 << 40))
-			yb_last_commit_ht = last_received;
+			yb_set_last_commit_ht(last_received);
 		else
 			elog(DEBUG2, "YB_PG_SUB: [6/6 APPLY] not seeding yb_last_commit_ht "
 				 "from origin_startpos %X/%X (sequential VWAL LSN, not HT)",
@@ -3159,7 +3175,7 @@ LogicalRepApplyLoop(XLogRecPtr last_received)
 								 "yb_last_commit_ht from %X/%X to %X/%X",
 								 LSN_FORMAT_ARGS(yb_last_commit_ht),
 								 LSN_FORMAT_ARGS((XLogRecPtr) timestamp));
-							yb_last_commit_ht = (XLogRecPtr) timestamp;
+							yb_set_last_commit_ht((XLogRecPtr) timestamp);
 						}
 
 						send_feedback(last_received, reply_requested, false);

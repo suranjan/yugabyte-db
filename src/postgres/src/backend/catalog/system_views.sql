@@ -1020,7 +1020,8 @@ CREATE VIEW pg_stat_subscription AS
             st.last_msg_send_time,
             st.last_msg_receipt_time,
             st.latest_end_lsn,
-            st.latest_end_time
+            st.latest_end_time,
+            st.yb_last_commit_ht
     FROM pg_subscription su
             LEFT JOIN pg_stat_get_subscription(NULL) st
                       ON (st.subid = su.oid);
