@@ -97,4 +97,29 @@ is( $result, qq(1|22|
 8|176|18
 9|198|19), 'generated columns replicated with trigger');
 
+# YB: every UPDATE above changes the primary key.  A key change cannot be applied
+# in place when the key is the row's storage key, so it is applied as a delete
+# plus an insert - and an insert writes the whole row, which hides whether the
+# columns written were chosen correctly.  A key-preserving UPDATE writes only the
+# columns the publisher sent, and neither a recomputed generated column nor a
+# trigger's assignment is among them.
+$node_publisher->safe_psql('postgres',
+	"CREATE TABLE tab2 (a int PRIMARY KEY, b int)");
+$node_subscriber->safe_psql('postgres',
+	"CREATE TABLE tab2 (a int PRIMARY KEY, b int, "
+	  . "c int GENERATED ALWAYS AS (b * 10) STORED)");
+$node_publisher->safe_psql('postgres', "INSERT INTO tab2 VALUES (1, 1)");
+
+# pub1 is FOR ALL TABLES, so tab2 only needs the subscription refreshed.
+$node_subscriber->safe_psql('postgres',
+	"ALTER SUBSCRIPTION sub1 REFRESH PUBLICATION");
+$node_subscriber->wait_for_subscription_sync;
+
+$node_publisher->safe_psql('postgres', "UPDATE tab2 SET b = 7 WHERE a = 1");
+$node_publisher->wait_for_catchup('sub1');
+
+$result = $node_subscriber->safe_psql('postgres', "SELECT a, b, c FROM tab2");
+is($result, qq(1|7|70),
+	'key-preserving UPDATE writes the recomputed generated column');
+
 done_testing();
