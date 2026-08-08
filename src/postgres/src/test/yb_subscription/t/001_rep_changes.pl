@@ -117,6 +117,23 @@ $result = $node_subscriber->safe_psql('postgres',
 is($result, "tab_include|d\ntab_mixed|d\ntab_rep|d",
 	'subscriber tab_rep, tab_mixed, tab_include have REPLICA IDENTITY DEFAULT');
 
+# A YugabyteDB publisher records each table's replica identity in the stream when
+# the slot is created, and never revisits it, so the later "add REPLICA IDENTITY
+# FULL so we can update" would not reach this subscription: the UPDATEs below
+# would be rejected forever and wedge the apply worker.  Set it up front instead.
+# tab_full_pk is already FULL above, and the assertions that FULL enables here are
+# the ones still commented out below, so nothing is lost by moving it earlier.
+my $yb_publisher = $node_publisher->can('is_yb') && $node_publisher->is_yb;
+if ($yb_publisher)
+{
+	$node_publisher->safe_psql('postgres',
+		"ALTER TABLE tab_full REPLICA IDENTITY FULL");
+	$node_publisher->safe_psql('postgres',
+		"ALTER TABLE tab_full2 REPLICA IDENTITY FULL");
+	$node_publisher->safe_psql('postgres',
+		"ALTER TABLE tab_ins REPLICA IDENTITY FULL");
+}
+
 # Setup logical replication
 my $publisher_connstr = $node_publisher->connstr . ' dbname=postgres';
 $node_publisher->safe_psql('postgres', "CREATE PUBLICATION tap_pub");

@@ -45,6 +45,11 @@ test code works with either Cluster or ExternalNode.
 
 =cut
 
+# Every external node, so a YugabyteDB publisher's wait_for_catchup can reach
+# the subscriber: apply progress against such a publisher is only observable
+# there, and wait_for_catchup is a method on the publisher.
+my @ALL_NODES;
+
 sub new
 {
 	my ($class, $connstr, $name, %opts) = @_;
@@ -61,6 +66,7 @@ sub new
 	};
 	bless $self, $class;
 	$self->_arm_log_baseline;
+	push @ALL_NODES, $self;
 	return $self;
 }
 
@@ -508,6 +514,99 @@ sub lsn
 	return $result eq '' ? undef : $result;
 }
 
+# Public form, for tests that must adapt to a YugabyteDB publisher.  Call it as
+# $node->can('is_yb') && $node->is_yb, so the same test still runs against a real
+# PostgreSQL::Test::Cluster publisher, which has no such method.
+sub is_yb
+{
+	my ($self) = @_;
+	return $self->_is_yb;
+}
+
+# Same test the apply worker applies to its own publisher (worker.c).
+sub _is_yb
+{
+	my ($self) = @_;
+	unless (exists $self->{_is_yb})
+	{
+		my $version = $self->safe_psql('postgres', 'SELECT version()');
+		$self->{_is_yb} = (index($version, '-YB-') >= 0) ? 1 : 0;
+	}
+	return $self->{_is_yb};
+}
+
+sub _quote_literal
+{
+	my ($str) = @_;
+	$str =~ s#\'#\'\'#g;
+	return "'$str'";
+}
+
+# Identify the subscription the way the upstream path does, by application_name:
+# it is not always the subscription name (021_twophase gives subscription
+# 'tap_sub_copy' the application_name 'appname_copy').  Anchored on the spaces
+# separating conninfo parameters so one name cannot match another it prefixes.
+sub _yb_find_downstream
+{
+	my ($self, $appname) = @_;
+	my $lit = _quote_literal($appname);
+	my $query = qq[SELECT subname FROM pg_catalog.pg_subscription
+	     WHERE subconninfo ~ ('(^|[ ])application_name=' || $lit || '([ ]|\$)')
+	        OR subname = $lit
+	     ORDER BY subname LIMIT 1];
+
+	foreach my $node (@ALL_NODES)
+	{
+		next if $node == $self;
+		my $subname = $node->safe_psql('postgres', $query);
+		return ($node, $subname) if defined($subname) && $subname ne '';
+	}
+	croak "no external node has a subscription with application_name '$appname'";
+}
+
+# A YugabyteDB publisher has no WAL position to compare: pg_current_wal_lsn() is
+# unsupported, and the LSNs in pg_stat_replication are virtual WAL positions.
+# Hybrid time is the real ordering.  The publisher's safe_time passes T only once
+# every commit at or before T has been streamed, so an applied hybrid time at or
+# past a target read now proves every earlier commit was applied.  $mode has no
+# analogue - there is one notion of apply progress.
+sub _yb_wait_for_catchup
+{
+	my ($self, $appname) = @_;
+	my ($downstream, $subname) = $self->_yb_find_downstream($appname);
+	my $target = $self->safe_psql('postgres', 'SELECT yb_get_current_hybrid_time_lsn()');
+	croak 'publisher ' . $self->name . ' returned no hybrid time'
+	  unless defined($target) && $target =~ /^\d+$/;
+
+	print "Waiting for subscription \"$subname\" on " . $downstream->name
+	  . " to apply past hybrid time $target\n";
+
+	# relid IS NULL selects the apply worker; a tablesync worker's progress says
+	# nothing about the subscription as a whole.  pid IS NOT NULL keeps only
+	# subscriptions that actually have a running worker: pg_stat_subscription
+	# left-joins pg_subscription, which is a shared catalog, so a same-named
+	# subscription in another database contributes an all-NULL row that would
+	# make bool_and false forever.  count(*) guards the empty case, where
+	# bool_and is NULL and the subscription has not started applying at all.
+	my $query = qq[SELECT count(*) > 0
+	                  AND bool_and(COALESCE(st.yb_last_commit_ht >= $target, false))
+	     FROM pg_catalog.pg_subscription s
+	     JOIN pg_catalog.pg_stat_subscription st ON st.subid = s.oid
+	    WHERE s.subname = ] . _quote_literal($subname) . qq[
+	      AND st.relid IS NULL AND st.pid IS NOT NULL];
+
+	# Query once directly first: safe_psql croaks with the server's own message,
+	# so a subscriber whose pg_stat_subscription has no yb_last_commit_ht fails
+	# immediately instead of after the poll timeout.
+	if ($downstream->safe_psql('postgres', $query) ne 't')
+	{
+		$downstream->poll_query_until('postgres', $query)
+		  or croak "timed out waiting for \"$subname\" to apply past hybrid time $target";
+	}
+	print "done\n";
+	return;
+}
+
 sub wait_for_catchup
 {
 	my ($self, $standby_name, $mode, $target_lsn) = @_;
@@ -515,6 +614,12 @@ sub wait_for_catchup
 	my %valid_modes = ('sent' => 1, 'write' => 1, 'flush' => 1, 'replay' => 1);
 	croak "unknown mode $mode for 'wait_for_catchup'" unless exists($valid_modes{$mode});
 	$standby_name = $standby_name->name if ref($standby_name) && $standby_name->can('name');
+
+	# An explicit LSN target has no hybrid-time equivalent, so leave it to the
+	# upstream path rather than silently waiting for something else.
+	return $self->_yb_wait_for_catchup($standby_name)
+	  if !defined($target_lsn) && $self->_is_yb;
+
 	$target_lsn = $self->lsn('write') unless defined($target_lsn);
 	print "Waiting for replication conn ${standby_name}'s ${mode}_lsn to pass $target_lsn on " . $self->name . "\n";
 	my $query = qq[SELECT '$target_lsn' <= ${mode}_lsn AND state = 'streaming'
