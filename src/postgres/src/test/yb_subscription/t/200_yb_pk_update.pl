@@ -29,6 +29,14 @@ my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
 $node_subscriber->init(allows_streaming => 'logical');
 $node_subscriber->start;
 
+# The premise above needs a PostgreSQL publisher, so this is not a YugabyteDB
+# limitation to work around: on a YugabyteDB publisher the message shape under
+# test is never produced, and pg_toast does not exist to confirm the setup.
+if ($node_publisher->can('is_yb') && $node_publisher->is_yb)
+{
+	plan skip_all => 'needs a PostgreSQL publisher; see the comment at the top';
+}
+
 # tab_extra_col has a column the publication cannot carry; tab_toast_col has one
 # the publisher deliberately does not resend.  tab_inplace repeats both against
 # an UPDATE that leaves the key alone, which is the case that must keep taking

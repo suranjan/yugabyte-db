@@ -47,6 +47,14 @@ my $node_subscriber = PostgreSQL::Test::Cluster->new('subscriber');
 $node_subscriber->init(allows_streaming => 'logical');
 $node_subscriber->start;
 
+# The premise above needs a PostgreSQL publisher, so this is not a YugabyteDB
+# limitation to work around: on a YugabyteDB publisher the message shape under
+# test is never produced, and pg_toast does not exist to confirm the setup.
+if ($node_publisher->can('is_yb') && $node_publisher->is_yb)
+{
+	plan skip_all => 'needs a PostgreSQL publisher; see the comment at the top';
+}
+
 # part_leaf carries nothing that would force the local row to be read on its own
 # account - no secondary index, no trigger, no check constraint, and the column
 # left out of the update is nullable - so the only reason to read it is that the
