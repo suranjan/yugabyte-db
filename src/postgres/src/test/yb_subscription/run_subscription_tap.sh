@@ -72,10 +72,21 @@ resolve()
 	fi
 }
 
+# 022_twophase_cascade and 100_bugs build extra local PostgreSQL nodes with
+# initdb, which YugabyteDB's initdb cannot do standalone.  They do not merely
+# fail: they call BAIL_OUT, and prove abandons every test still queued behind a
+# bailout, so leaving them in truncates the run at 022 and silently loses
+# everything from 023 onwards.  Name one explicitly to run it anyway.
+SKIP_BY_DEFAULT="022_twophase_cascade.pl 100_bugs.pl"
+
 tests=()
 if [ $# -eq 0 ]; then
 	for f in "$PG_TEST_DIR"/t/*.pl "$YB_TEST_DIR"/t/*.pl; do
-		tests+=("$(basename "$f")")
+		name=$(basename "$f")
+		case " $SKIP_BY_DEFAULT " in
+			*" $name "*) continue ;;
+		esac
+		tests+=("$name")
 	done
 	# YB-only tests have no upstream file, so the two globs overlap; dedupe.
 	mapfile -t tests < <(printf '%s\n' "${tests[@]}" | sort -u)
@@ -84,6 +95,9 @@ else
 	for t in "$@"; do tests+=("$(resolve "$t")"); done
 fi
 
+if [ $# -eq 0 ]; then
+	echo "Not run (they BAIL_OUT and would truncate the suite):$(printf ' %s' $SKIP_BY_DEFAULT)"
+fi
 echo "Running ${#tests[@]} subscription TAP test(s)..."
 cd "$YB_TEST_DIR"
 /usr/bin/prove --exec "$PERL_EXEC" -v "${tests[@]}"

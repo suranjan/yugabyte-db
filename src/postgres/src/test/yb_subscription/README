@@ -106,4 +106,32 @@ over some column types (002, 014), and non-UTF8 database encodings (005).
 
 022_twophase_cascade and 100_bugs build extra local PostgreSQL nodes with
 initdb, which YugabyteDB's initdb cannot do standalone, so they need a real
-community PostgreSQL binary on PATH and do not run here.
+community PostgreSQL binary on PATH and do not run here.  They do not merely
+fail, they BAIL_OUT, and prove abandons everything queued behind a bailout, so
+run_subscription_tap.sh leaves them out of a no-argument run; name one
+explicitly to run it anyway.
+
+Measured coverage, YugabyteDB publisher and subscriber
+------------------------------------------------------
+
+33 files, pgoutput on both sides, default replica identity: 11 pass, 5 fail
+part-way, 13 bail, 4 skip; 145 of 161 assertions.  Read that by cause rather
+than by the totals, because most of what does not run is a publisher-side
+feature gap and says nothing about replication:
+
+  - 10 of the 13 bails are the gaps listed above - PREPARE TRANSACTION (021,
+    023, 029), publication FOR TABLES IN SCHEMA (025, 028), a PRIMARY KEY over
+    an array type (002, 014), non-UTF8 encoding (005) - plus 017 and 019, which
+    mix DDL and DML in one transaction and abort on the publisher before
+    replication is reached.
+  - The other 3 are real bugs.  020 emits a transactional logical decoding
+    message, which crashes the backend and restarts the postmaster.  015 and
+    016 update and delete rows their own uncommitted transaction inserted, which
+    the publisher cannot build a before image for, so the apply worker
+    crash-loops; cdc_enable_intra_transactional_before_image covers it.
+  - The 4 skips are ICU (012), the two PostgreSQL-publisher tests (200, 201),
+    and 203, which needs yb_subscription_use_yboutput.
+
+So 19 files actually exercise replication, and 11 of them pass outright.  The 5
+partial failures - 003, 010, 013, 027, 031 - are the ones still worth digging
+into; nothing about them has been traced to a cause yet.
