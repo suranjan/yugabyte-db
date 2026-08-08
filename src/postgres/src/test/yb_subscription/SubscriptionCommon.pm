@@ -102,7 +102,13 @@ sub _existing_test_dbs
 sub _drop_subscriptions
 {
 	my ($role, $db) = @_;
-	my $out = _run_sql($role, $db, 'SELECT subname FROM pg_subscription');
+	# pg_subscription is a shared catalog, but DROP SUBSCRIPTION only reaches
+	# the current database, so an unscoped list would try to drop other
+	# databases' subscriptions and leave this one's behind.
+	my $out = _run_sql($role, $db,
+		'SELECT subname FROM pg_subscription
+		 WHERE subdbid = (SELECT oid FROM pg_database
+		                  WHERE datname = current_database())');
 	for my $sub (grep { $_ ne '' } split /\n/, $out)
 	{
 		_run_sql($role, $db, qq{ALTER SUBSCRIPTION "$sub" DISABLE;});
@@ -112,17 +118,92 @@ sub _drop_subscriptions
 	return;
 }
 
+# A transaction left prepared by a test that died holds its xid for as long as
+# the cluster lives, and that blocks DROP DATABASE as well as every later
+# CREATE_REPLICATION_SLOT, which waits for all running transactions to finish.
+# One dead two-phase test would otherwise hang the whole rest of the suite.
+sub _rollback_prepared
+{
+	my ($role, $db) = @_;
+	my $out = _run_sql($role, $db,
+		'SELECT gid FROM pg_prepared_xacts WHERE database = current_database()');
+	for my $gid (grep { $_ ne '' } split /\n/, $out)
+	{
+		$gid =~ s/'/''/g;
+		_run_sql($role, $db, qq{ROLLBACK PREPARED '$gid';});
+	}
+	return;
+}
+
+# Empty a database instead of recreating it, for a cluster that is not ours: a
+# publisher we did not start may hold state we should not destroy wholesale, and
+# DROP DATABASE fails there whenever any other session is still connected - a
+# failure that is invisible, because errors are ignored here by design.  The
+# recreated public schema is given PostgreSQL's default owner and ACL so that
+# permission tests (027_nosuperuser) see what a fresh database would give them.
+sub _clean_db_contents
+{
+	my ($role, $db) = @_;
+
+	_run_sql($role, $db, <<"SQL");
+DO \$\$
+DECLARE
+	obj text;
+BEGIN
+	FOR obj IN SELECT pubname FROM pg_publication LOOP
+		EXECUTE format('DROP PUBLICATION %I', obj);
+	END LOOP;
+	FOR obj IN SELECT nspname FROM pg_namespace
+	           WHERE nspname NOT LIKE 'pg\\_%' AND nspname <> 'information_schema'
+	LOOP
+		EXECUTE format('DROP SCHEMA %I CASCADE', obj);
+	END LOOP;
+END \$\$;
+CREATE SCHEMA public;
+ALTER SCHEMA public OWNER TO pg_database_owner;
+GRANT USAGE ON SCHEMA public TO PUBLIC;
+SQL
+	return;
+}
+
+# Dropping a subscription leaves nothing behind normally, but one that was cut
+# off from its database (a crash mid-DROP, or DROP DATABASE that got through)
+# leaves its origins in pg_replication_origin forever.  That catalog is shared,
+# so 001_rep_changes' "SELECT count(*) FROM pg_replication_origin" sees them from
+# any database and fails.  Origins can be dropped by name from anywhere, unlike
+# the subscription itself, so clear the ones with no subscription left.
+sub _drop_orphaned_origins
+{
+	my ($role, $db) = @_;
+	_run_sql($role, $db,
+		"SELECT pg_replication_origin_drop(roname) FROM pg_replication_origin
+		  WHERE roname ~ '^pg_[0-9]+'
+		    AND split_part(roname, '_', 2)::oid
+		        NOT IN (SELECT oid FROM pg_subscription)");
+	return;
+}
+
 sub _reset_db
 {
 	my ($role, $db) = @_;
 
 	_drop_subscriptions($role, $db);
+	_drop_orphaned_origins($role, $db);
+	_rollback_prepared($role, $db);
 
 	# Scoped to this database on purpose: the publisher may be shared, and
 	# dropping unrelated slots would break whoever owns them.
 	_run_sql($role, _admin_db($role),
 		"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database = '$db'"
 	);
+
+	# The extra databases (_s1, _p2, ...) exist only for the tests, so those are
+	# still recreated; only the database the tests actually name is emptied.
+	if ($role eq 'pub' && $db eq $TEST_DB)
+	{
+		_clean_db_contents($role, $db);
+		return;
+	}
 
 	_run_sql($role, _admin_db($role),
 		qq{DROP DATABASE IF EXISTS "$db";\nCREATE DATABASE "$db";\n});
