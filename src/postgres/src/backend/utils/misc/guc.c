@@ -912,6 +912,7 @@ static char *restrict_nonsystem_relation_kind_string;
 bool		yb_enable_memory_tracking = true;
 bool		yb_enable_pg_subscription = false;
 bool		yb_test_subscription_skip_feedback = false;
+bool		yb_subscription_use_yboutput = false;
 static char *yb_effective_transaction_isolation_level_string;
 static char *yb_xcluster_consistency_level_string;
 static char *yb_read_time_string;
@@ -2758,6 +2759,23 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&yb_enable_pg_subscription,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_subscription_use_yboutput", PGC_USERSET, REPLICATION_SUBSCRIBERS,
+			gettext_noop("Create subscription slots with the yboutput plugin "
+						 "instead of pgoutput."),
+			gettext_noop("Only yboutput carries YugabyteDB's own replica "
+						 "identities, so a table with replica identity CHANGE "
+						 "can only be replicated to a subscription with this "
+						 "enabled. Set it in the configuration file rather "
+						 "than per session: tablesync workers create their own "
+						 "slots and do not inherit a session setting."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_subscription_use_yboutput,
 		false,
 		NULL, NULL, NULL
 	},

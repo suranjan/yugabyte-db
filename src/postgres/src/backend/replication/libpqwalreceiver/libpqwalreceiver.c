@@ -28,11 +28,15 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "pqexpbuffer.h"
+#include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
 #include "utils/pg_lsn.h"
 #include "utils/tuplestore.h"
+
+/* YB includes */
+#include "pg_yb_utils.h"
 
 PG_MODULE_MAGIC;
 
@@ -896,7 +900,17 @@ libpqrcv_create_slot(WalReceiverConn *conn, const char *slotname,
 
 	if (conn->logical)
 	{
-		appendStringInfoString(&cmd, " LOGICAL pgoutput ");
+		/*
+		 * The plugin named here is the one recorded on the slot, so it also
+		 * decides what a later START_REPLICATION decodes with.  pgoutput
+		 * rejects replica identity CHANGE, which leaves a subscription unable
+		 * to stream such a table at all; yboutput is the same protocol plus
+		 * YugabyteDB's replica identities, and omitted columns reach the
+		 * subscriber as ordinary unchanged-toast markers.
+		 */
+		appendStringInfo(&cmd, " LOGICAL %s ",
+						 (IsYugaByteEnabled() && yb_subscription_use_yboutput) ?
+						 YB_OUTPUT_PLUGIN : PG_OUTPUT_PLUGIN);
 		if (use_new_options_syntax)
 			appendStringInfoChar(&cmd, '(');
 		if (two_phase)
