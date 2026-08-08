@@ -1,0 +1,109 @@
+src/test/yb_subscription/README
+
+Running the subscription TAP tests against YugabyteDB
+=====================================================
+
+This directory runs the upstream subscription/logical-replication TAP suite
+(src/test/subscription) against an external cluster: a YugabyteDB subscriber,
+and a publisher that is either PostgreSQL or another YugabyteDB.
+
+Nothing under src/test/subscription is modified.  The harness is loaded through
+PERL5OPT (-MSubscriptionCommon), which patches PostgreSQL::Test::Cluster->new()
+to return an ExternalNode before the test body runs, so a test that says
+
+    my $node = PostgreSQL::Test::Cluster->new('subscriber');
+
+gets a handle to the existing cluster instead of one built by initdb.
+
+What is in t/
+-------------
+
+Only the tests that needed real changes.  Everything else runs unmodified from
+src/test/subscription/t, and run_subscription_tap.sh picks the copy here when
+one exists.  So this directory is the answer to "what did YugabyteDB need?",
+and each answer is one diff away:
+
+    diff -u ../subscription/t/001_rep_changes.pl t/001_rep_changes.pl
+
+200_* and 201_* have no upstream counterpart; they are YugabyteDB-only tests.
+
+Running
+-------
+
+    ./run_subscription_tap.sh                       # whole suite
+    ./run_subscription_tap.sh 001_rep_changes.pl    # one test
+
+with PG_PUBLISHER_CONNSTR, PG_PUBLISHER_PSQL_PATH, YB_SUBSCRIBER_CONNSTR and
+YB_YSQLSH_PATH exported.  run_subscription_tap_manual.sh does the same without
+the environment checks, for driving the pieces by hand.
+
+Subscriber flags
+----------------
+
+    yugabyted start --tserver_flags \
+      'ysql_yb_enable_replication_commands=true,ysql_pg_conf_csv={yb_enable_pg_subscription=on,max_logical_replication_workers=6}'
+
+The braces around ysql_pg_conf_csv are required.  Without them yugabyted does
+not recognise the setting as its own, appends a second ysql_pg_conf_csv={...}
+flag, and gflags keeps only the last occurrence - so the cluster starts cleanly
+with the setting silently absent.  max_logical_replication_workers must be at
+least 6: 010_truncate asks for that via append_conf, which cannot raise a
+PGC_POSTMASTER setting on a running server, and without it the last
+subscription never gets a tablesync worker and the test waits forever instead
+of failing.  Neither setting can be changed at runtime; restart the cluster.
+
+Extra flags for a YugabyteDB publisher
+--------------------------------------
+
+Running publisher-side as well as subscriber-side on YugabyteDB needs more,
+and each of these fails in a way that looks like a hang rather than an error:
+
+    --master_flags  'TEST_dcheck_for_missing_schema_packing=false'
+    --tserver_flags 'ysql_yb_use_commit_time_ht_in_replication=true,
+                     ysql_yb_default_replica_identity=DEFAULT,
+                     TEST_dcheck_for_missing_schema_packing=false,
+                     ysql_pg_conf_csv={...,
+                       yb_default_replica_identity=DEFAULT,
+                       yb_enable_replication_slot_exclusive_lock=on,
+                       wal_sender_timeout=6s}'
+
+ysql_yb_use_commit_time_ht_in_replication makes the protocol commit_time carry
+the raw hybrid time; without it wait_for_catchup compares a hybrid time against
+a PG-epoch timestamp and never converges.
+
+yb_default_replica_identity must be set as the tserver gflag, not only in
+ysql_pg_conf_csv.  It is read in two places (pg_create_table.cc, TODO(#22409)):
+PostgreSQL's relcache reads the GUC and writes pg_class.relreplident, while the
+DocDB table property comes from the gflag, and the master builds the CDC
+stream's replica-identity map from the DocDB schema.  Set only the GUC and
+pg_class reads 'd' while the stream still says CHANGE, so pgoutput rejects every
+START_REPLICATION and the apply and tablesync workers restart forever.
+pg_class is the one that lies here; do not use it to confirm the setting.
+
+yb_enable_replication_slot_exclusive_lock lets tablesync workers drop their
+temporary slots.  Without it each one dies at the end of COPY and
+pg_subscription_rel never leaves 'f'/'i'.
+
+wal_sender_timeout is not required, but wait_for_catchup waits for a hybrid time
+read on the publisher after the last commit, which only a keepalive can satisfy.
+Keepalives arrive every wal_sender_timeout/2, so the stock 60s costs ~30s per
+wait; 6s cuts a full run several-fold.
+
+TEST_dcheck_for_missing_schema_packing is a debug-build workaround for a CHECK
+that fires when a table is created while a slot is being consumed (#32851).  It
+is needed on the master as well as the tserver - the master crashes first, and a
+tserver that then reads the CDC state table mid-outage takes itself down on a
+second CHECK and leaves a slot row that re-crashes it on every later read.
+
+Known gaps with a YugabyteDB publisher
+--------------------------------------
+
+Some upstream tests cannot pass and are not adapted, because the publisher-side
+feature does not exist on YugabyteDB rather than because replication is wrong:
+PREPARE TRANSACTION (021, 023, 029), CREATE/ALTER PUBLICATION ... SCHEMA (025,
+028), ALTER TABLE ... REPLICA IDENTITY USING INDEX (031, #1124), a PRIMARY KEY
+over some column types (002, 014), and non-UTF8 database encodings (005).
+
+022_twophase_cascade and 100_bugs build extra local PostgreSQL nodes with
+initdb, which YugabyteDB's initdb cannot do standalone, so they need a real
+community PostgreSQL binary on PATH and do not run here.
