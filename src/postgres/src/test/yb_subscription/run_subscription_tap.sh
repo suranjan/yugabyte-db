@@ -39,6 +39,33 @@ mkdir -p "$TESTDIR"
 # runner process and dies before any test starts.
 PERL_EXEC="perl -I$PERL_LIB -I$YB_TEST_DIR -MSubscriptionCommon"
 
+# Say which two servers this is about to use, and refuse the one combination that
+# is always a mistake.  Both connection strings have defaults, so forgetting to
+# export them does not fail: the publisher quietly falls back to a local
+# PostgreSQL on 5432 and the subscriber to 127.0.0.1:5433, which is usually the
+# publisher cluster.  A run like that replicates the wrong direction between the
+# wrong servers and still reports passes, so print the endpoints and stop if they
+# are the same server.
+pub_endpoint=$(echo "$PG_CONN" | grep -oE 'host=[^ ]+|port=[0-9]+' | sort | tr '\n' ' ')
+sub_endpoint=$(echo "$YB_CONN" | grep -oE 'host=[^ ]+|port=[0-9]+' | sort | tr '\n' ' ')
+pub_version=$("$PG_PSQL" "$PG_CONN" -t -A -c "SELECT version()" 2>/dev/null | head -1)
+case "$pub_version" in
+	*-YB-*) pub_kind="YugabyteDB" ;;
+	PostgreSQL*) pub_kind="PostgreSQL" ;;
+	*) pub_kind="unreachable" ;;
+esac
+echo "Publisher  ($pub_kind): $PG_CONN"
+echo "Subscriber (YugabyteDB): $YB_CONN"
+if [ "$pub_endpoint" = "$sub_endpoint" ]; then
+	echo "ERROR: publisher and subscriber are the same server ($pub_endpoint)." >&2
+	echo "  Export PG_PUBLISHER_CONNSTR and YB_SUBSCRIBER_CONNSTR explicitly." >&2
+	exit 1
+fi
+if [ "$pub_kind" = unreachable ]; then
+	echo "ERROR: cannot reach the publisher at $PG_CONN with $PG_PSQL." >&2
+	exit 1
+fi
+
 # Require subscription enabled on the subscriber (must start yugabyted with ysql_pg_conf_csv).
 SUB_OK=$("$YB_YSQLSH_PATH" "$YB_CONN" -t -A -c "SELECT current_setting('yb_enable_pg_subscription', true);" 2>/dev/null || echo "off")
 if [ "$SUB_OK" != "on" ]; then

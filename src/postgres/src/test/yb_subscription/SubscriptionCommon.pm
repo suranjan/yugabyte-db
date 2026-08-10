@@ -183,6 +183,50 @@ sub _drop_orphaned_origins
 	return;
 }
 
+# pg_drop_replication_slot refuses a slot that is still active, and _run_sql
+# swallows the error, so the old one-shot drop silently did nothing whenever a
+# test died with its walsender still attached - and _drop_subscriptions has
+# already set slot_name = NONE by then, so nothing else will ever reclaim it.
+# Every later test that wants the same slot name then fails at
+# CREATE_REPLICATION_SLOT with "already exists", which is how one slow test
+# takes unrelated ones down with it.
+#
+# So detach the walsender first, and retry: the slot stays active until that
+# backend actually exits.  Still scoped to this database, because the publisher
+# may be shared and dropping someone else's slots would break them.
+sub _drop_slots
+{
+	my ($role, $db) = @_;
+	my $admin = _admin_db($role);
+
+	for my $attempt (1 .. 10)
+	{
+		my $out = _run_sql($role, $admin,
+			"SELECT slot_name FROM pg_replication_slots WHERE database = '$db'");
+		return unless grep { $_ ne '' } split /\n/, $out;
+
+		_run_sql($role, $admin,
+			"SELECT pg_terminate_backend(active_pid) FROM pg_replication_slots
+			 WHERE database = '$db' AND active_pid IS NOT NULL");
+		# Attempt every slot rather than only the ones currently inactive: the
+		# flag clears a moment after the backend goes, and errors here are
+		# ignored anyway, so filtering only loses races.
+		_run_sql($role, $admin,
+			"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots
+			 WHERE database = '$db'");
+
+		sleep 1;
+	}
+
+	# Say so rather than leaving the next test to fail on it mysteriously.
+	my $left = _run_sql($role, $admin,
+		"SELECT string_agg(slot_name, ', ') FROM pg_replication_slots WHERE database = '$db'");
+	$left =~ s/\s+$//;
+	print STDERR "warning: slots still on $role/$db after reset: $left\n"
+	  if $left ne '';
+	return;
+}
+
 sub _reset_db
 {
 	my ($role, $db) = @_;
@@ -191,11 +235,7 @@ sub _reset_db
 	_drop_orphaned_origins($role, $db);
 	_rollback_prepared($role, $db);
 
-	# Scoped to this database on purpose: the publisher may be shared, and
-	# dropping unrelated slots would break whoever owns them.
-	_run_sql($role, _admin_db($role),
-		"SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE database = '$db'"
-	);
+	_drop_slots($role, $db);
 
 	# The extra databases (_s1, _p2, ...) exist only for the tests, so those are
 	# still recreated; only the database the tests actually name is emptied.
