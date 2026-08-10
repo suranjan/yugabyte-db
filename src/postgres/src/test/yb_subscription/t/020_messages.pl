@@ -4,18 +4,18 @@
 
 # Tests that logical decoding messages
 #
-# YugabyteDB copy.  Logical decoding here reads DocDB change records
-# (yb_decode.c), never this instance's WAL, so nothing pg_logical_emit_message()
-# writes can reach a replication slot and every assertion upstream makes about a
-# message arriving on one is unreachable.  Transactional messages are therefore
-# rejected outright, and what is left to test is that the rejection is an error
-# rather than the crash it used to be: LogLogicalMessage() assigned an xid
-# without marking the transaction as one that runs PostgreSQL's commit path, so
-# the backend died on Assert(!TransactionIdIsValid(proc->xid)) in
-# ProcArrayEndTransaction() and the postmaster died reaping it, restarting the
-# whole instance.  In a release build the xid was instead left in the procarray
-# after the transaction ended, so the backend_xid check below is the one that
-# still means something without assertions.
+# YugabyteDB copy.  There is no storage for the PG WAL, so nothing
+# pg_logical_emit_message() writes can reach a replication slot, and every
+# assertion upstream makes about a message arriving on one is unreachable.  Both
+# forms are therefore rejected, and what is left to test is that the rejection is
+# an error rather than the crash the transactional form used to be:
+# LogLogicalMessage() assigned an xid without marking the transaction as one that
+# runs PostgreSQL's commit path, so the backend died on
+# Assert(!TransactionIdIsValid(proc->xid)) in ProcArrayEndTransaction() and the
+# postmaster died reaping it, restarting the whole instance.  In a release build
+# the xid was instead left in the procarray after the transaction ended, so the
+# backend_xid check below is the one that still means something without
+# assertions.
 use strict;
 use warnings;
 use PostgreSQL::Test::Cluster;
@@ -34,18 +34,16 @@ if (!($node_publisher->can('is_yb') && $node_publisher->is_yb))
 my $start_time =
   $node_publisher->safe_psql('postgres', 'SELECT pg_postmaster_start_time()');
 
-# Non-transactional messages are still accepted; only the transactional form
-# assigned the xid that broke.
-like(
-	$node_publisher->safe_psql(
-		'postgres', qq(
-		SELECT pg_logical_emit_message(false, 'pgoutput',
-			'a non-transactional message')
-	)),
-	qr{^[0-9A-F]+/[0-9A-F]+$}i,
-	'non-transactional message is accepted');
-
 my ($ret, $stdout, $stderr) = $node_publisher->psql(
+	'postgres', qq(
+	SELECT pg_logical_emit_message(false, 'pgoutput',
+		'a non-transactional message')
+	),
+	on_error_stop => 1);
+
+isnt($ret, 0, 'non-transactional message is rejected');
+
+($ret, $stdout, $stderr) = $node_publisher->psql(
 	'postgres', qq(
 	SELECT pg_logical_emit_message(true, 'pgoutput', 'a transactional message')
 	),
@@ -54,7 +52,7 @@ my ($ret, $stdout, $stderr) = $node_publisher->psql(
 isnt($ret, 0, 'transactional message is rejected');
 like(
 	$stderr,
-	qr/transactional logical decoding messages are not supported/,
+	qr/logical decoding messages are not supported/,
 	'rejection names the unsupported feature');
 
 # The session survives the error, and leaves no xid behind in the procarray.
