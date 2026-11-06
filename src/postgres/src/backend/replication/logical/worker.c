@@ -3487,6 +3487,10 @@ send_feedback(XLogRecPtr recvpos, bool force, bool requestReply)
 	if (!force && wal_receiver_status_interval <= 0)
 		return;
 
+	/* YB: unlike the check above, this also withholds forced replies. */
+	if (yb_test_subscription_skip_feedback)
+		return;
+
 	/* It's legal to not pass a recvpos */
 	if (recvpos < last_recvpos)
 		recvpos = last_recvpos;

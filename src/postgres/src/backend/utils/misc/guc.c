@@ -911,6 +911,7 @@ static char *restrict_nonsystem_relation_kind_string;
 
 bool		yb_enable_memory_tracking = true;
 bool		yb_enable_pg_subscription = false;
+bool		yb_test_subscription_skip_feedback = false;
 static char *yb_effective_transaction_isolation_level_string;
 static char *yb_xcluster_consistency_level_string;
 static char *yb_read_time_string;
@@ -2757,6 +2758,19 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&yb_enable_pg_subscription,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_test_subscription_skip_feedback", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("Testing only: logical replication workers send the publisher no feedback."),
+			gettext_noop("Keeps the publisher unaware of what was applied, so a worker "
+						 "restart is resent those transactions. SUSET so a test can set "
+						 "it with ALTER DATABASE without restarting the server."),
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_test_subscription_skip_feedback,
 		false,
 		NULL, NULL, NULL
 	},

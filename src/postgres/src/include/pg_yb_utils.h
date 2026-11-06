@@ -170,6 +170,7 @@ extern bool IsYugaByteEnabled();
 
 extern bool yb_enable_docdb_tracing;
 extern bool yb_enable_pg_subscription;
+extern bool yb_test_subscription_skip_feedback;
 extern bool yb_enable_spi_dist_tracing;
 
 extern bool yb_read_from_followers;
