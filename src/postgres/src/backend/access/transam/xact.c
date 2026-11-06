@@ -1388,7 +1388,20 @@ RecordTransactionCommit(void)
 	bool		wrote_xlog;
 
 	if (IsYugaByteEnabled() && !YbCurrentTxnUsesTempRel())
+	{
+		/*
+		 * YB: DocDB has already committed, so advance the session's origin
+		 * here, as PG does after writing the commit record.  In memory only: no
+		 * local WAL, and on YB it is never checkpointed.  Workers reset it from
+		 * durable progress at start (see yb_reset_origin_progress).
+		 */
+		if (replorigin_session_origin != InvalidRepOriginId &&
+			replorigin_session_origin != DoNotReplicateId &&
+			replorigin_session_origin_lsn != InvalidXLogRecPtr)
+			replorigin_session_advance(replorigin_session_origin_lsn,
+									   InvalidXLogRecPtr);
 		return InvalidTransactionId;
+	}
 
 	/*
 	 * Log pending invalidations for logical decoding of in-progress

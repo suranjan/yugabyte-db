@@ -545,10 +545,12 @@ YbExecSimpleRelationInsert(ResultRelInfo *resultRelInfo, EState *estate,
 
 	/*
 	 * YB: a conflicting row reports a duplicate key, as on PG.  That includes
-	 * replay of a transaction committed before a crash: YB does not persist
-	 * origin progress with the commit.  TODO: a follow-up diff records the
-	 * applied LSN / commit hybrid time in a separate table, written in the
-	 * apply transaction, so that replayed transactions are skipped.
+	 * a transaction resent after any worker restart: YB records no durable
+	 * apply progress yet, so a restarted worker starts from the slot's
+	 * confirmed position (see ApplyWorkerMain).  TODO: a follow-up diff
+	 * records the applied LSN / commit hybrid time in a separate table,
+	 * written in the apply transaction, so that replayed transactions are
+	 * skipped.
 	 */
 	YBCExecuteInsert(rel, slot, ONCONFLICT_NONE);
 
@@ -785,7 +787,7 @@ ExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
 				recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
 													   slot, estate, false, false,
 													   NULL, NIL);
-		}
+		}						/* YB */
 
 		/* AFTER ROW INSERT Triggers */
 		ExecARInsertTriggers(estate, resultRelInfo, slot,
@@ -879,7 +881,7 @@ ExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
 				recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
 													   slot, estate, true, false,
 													   NULL, NIL);
-		}
+		}						/* YB */
 
 		/* AFTER ROW UPDATE Triggers */
 		ExecARUpdateTriggers(estate, resultRelInfo,
@@ -949,7 +951,7 @@ ExecSimpleRelationDelete(ResultRelInfo *resultRelInfo,
 		{
 			/* OK, delete the tuple */
 			simple_table_tuple_delete(rel, tid, estate->es_snapshot);
-		}
+		}						/* YB */
 
 		/* AFTER ROW DELETE Triggers */
 		ExecARDeleteTriggers(estate, resultRelInfo,

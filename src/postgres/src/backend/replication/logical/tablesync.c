@@ -1320,6 +1320,10 @@ LogicalRepSyncTableStart(XLogRecPtr *origin_startpos)
 		 * time this tablesync was launched.
 		 */
 		originid = replorigin_by_name(originname, false);
+
+		if (IsYugaByteEnabled())
+			yb_reset_origin_progress(originid);
+
 		replorigin_session_setup(originid);
 		replorigin_session_origin = originid;
 		*origin_startpos = replorigin_session_get_progress(false);

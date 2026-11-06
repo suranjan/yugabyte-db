@@ -20,6 +20,7 @@ import java.util.List;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.yb.YBTestRunner;
+import org.yb.client.TestUtils;
 
 /**
  * Apply-path cases that turn on the shape of the target relation rather than on
@@ -236,5 +237,35 @@ public class TestPgSubscriptionApplyChecks extends BasePgSubscriptionApplyTest {
     execOnPublisher("INSERT INTO t VALUES (3, 'sentinel')");
     waitForRows("SELECT id, val FROM t ORDER BY id",
                 Arrays.asList(row("1", "keep"), row("3", "sentinel")));
+  }
+
+  /**
+   * YB writes no commit record to carry origin progress, so it is advanced in
+   * memory at commit instead; pg_replication_origin_status must follow each
+   * applied transaction.
+   */
+  @Test
+  public void testOriginProgressAdvancesOnApply() throws Exception {
+    createReplicatedTable("t", stmt -> {
+      stmt.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)");
+    });
+
+    execOnPublisher("INSERT INTO t VALUES (1, 'a')");
+    waitForRowCount("t", 1);
+    String first = waitForOriginProgressAbove("0/0");
+
+    execOnPublisher("INSERT INTO t VALUES (2, 'b')");
+    waitForRowCount("t", 2);
+    waitForOriginProgressAbove(first);
+  }
+
+  /** Waits until the subscription's origin reports a remote_lsn above lsn. */
+  private String waitForOriginProgressAbove(String lsn) throws Exception {
+    String query = "SELECT s.remote_lsn FROM pg_replication_origin_status s "
+        + "JOIN pg_subscription sub ON s.external_id = 'pg_' || sub.oid "
+        + "WHERE sub.subname = 'test_sub' AND s.remote_lsn > '" + lsn + "'";
+    TestUtils.waitFor(() -> !fetchRows(subConn, query).isEmpty(),
+                      REPLICATION_TIMEOUT_MS, REPLICATION_POLL_INTERVAL_MS);
+    return fetchRows(subConn, query).get(0).get(0);
   }
 }

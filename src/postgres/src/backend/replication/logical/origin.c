@@ -609,6 +609,15 @@ CheckPointReplicationOrigin(void)
 	if (max_replication_slots == 0)
 		return;
 
+	/*
+	 * YB: keep origin progress in memory only.  It is advanced without WAL
+	 * (see RecordTransactionCommit), and a persisted copy would outlive its
+	 * origin: a drop clears it only on the node that runs the drop, and origin
+	 * IDs are reused.
+	 */
+	if (YBIsEnabledInPostgresEnvVar())
+		return;
+
 	INIT_CRC32C(crc);
 
 	/* make sure no old temp file is remaining */
@@ -742,6 +751,10 @@ StartupReplicationOrigin(void)
 #endif
 
 	if (max_replication_slots == 0)
+		return;
+
+	/* YB: nothing to recover; see CheckPointReplicationOrigin. */
+	if (YBIsEnabledInPostgresEnvVar())
 		return;
 
 	INIT_CRC32C(crc);

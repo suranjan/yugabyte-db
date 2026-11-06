@@ -4191,6 +4191,10 @@ ApplyWorkerMain(Datum main_arg)
 		originid = replorigin_by_name(originname, true);
 		if (!OidIsValid(originid))
 			originid = replorigin_create(originname);
+
+		if (IsYugaByteEnabled())
+			yb_reset_origin_progress(originid);
+
 		replorigin_session_setup(originid);
 		replorigin_session_origin = originid;
 		origin_startpos = replorigin_session_get_progress(false);
@@ -4595,4 +4599,17 @@ yb_force_subscription_reread(void)
 	CatalogCacheFlushCatalog(SubscriptionRelRelationId);
 	CatalogCacheFlushCatalog(SubscriptionRelationId);
 	MySubscriptionValid = false;
+}
+
+/*
+ * YB: discard an origin's in-memory progress before a worker resumes from it.
+ * A drop clears it only on the node that ran the drop, and origin IDs are
+ * reused, so another node may hold a dropped origin's stale progress.  With no
+ * durable progress yet, the worker starts from the slot's confirmed position.
+ */
+void
+yb_reset_origin_progress(RepOriginId originid)
+{
+	replorigin_advance(originid, InvalidXLogRecPtr, InvalidXLogRecPtr,
+					   true /* go backward */ , false /* WAL log */ );
 }

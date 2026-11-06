@@ -114,5 +114,6 @@ am_tablesync_worker(void)
 
 /* YB declarations */
 extern bool yb_logicalrep_owns_subscription(Oid subid);
+extern void yb_reset_origin_progress(RepOriginId originid);
 
 #endif							/* WORKER_INTERNAL_H */
