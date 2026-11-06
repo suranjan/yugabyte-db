@@ -178,5 +178,6 @@ bool		VacuumCostActive = false;
 
 char        *YbSystemDbName = "yb_system";
 char        *PgYbNotificationsTableName = "pg_yb_notifications";
+char        *PgYbSubscriptionProgressTableName = "pg_yb_subscription_progress";
 char        *PgYbNotificationsPublicationName = "pg_yb_notifications_publication";
 char        *YbNotificationsSlotPrefix = "yb_notifications_";

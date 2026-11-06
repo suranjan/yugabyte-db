@@ -199,6 +199,7 @@
 /* YB includes */
 #include "executor/ybModifyTable.h"
 #include "pg_yb_utils.h"
+#include "replication/yb_apply_progress.h"
 #include "utils/snapmgr.h"
 #include "yb/yql/pggate/ybc_pggate.h"
 
@@ -294,6 +295,21 @@ bool		yb_publisher_is_yb = false;
 static XLogRecPtr yb_remote_commit_ht = InvalidXLogRecPtr;
 static XLogRecPtr yb_last_commit_ht = InvalidXLogRecPtr;
 
+/*
+ * YB: the last transaction this worker applied, as recorded in the
+ * subscription progress table within that transaction.  YB does not persist
+ * origin progress with the commit, so after a restart the publisher resends
+ * whatever it had not been told was flushed.  end_lsn seeds the apply
+ * worker's origin at start, so the walsender filters those transactions (see
+ * ApplyWorkerMain); yb_xact_already_applied catches any that still arrive,
+ * identifying them by commit hybrid time from a YugabyteDB publisher and by
+ * commit end LSN from a PostgreSQL one.  Read once: at start by the apply
+ * worker, on the first BEGIN by a tablesync worker.
+ */
+static uint64 yb_applied_commit_ht = 0;
+static XLogRecPtr yb_applied_end_lsn = InvalidXLogRecPtr;
+static bool yb_applied_progress_loaded = false;
+
 /* fields valid only when processing streamed transaction */
 static bool in_streamed_transaction = false;
 
@@ -361,6 +377,9 @@ static void store_flush_position(XLogRecPtr remote_lsn);
 static void maybe_reread_subscription(void);
 
 static void yb_set_last_commit_ht(XLogRecPtr ht);
+static void yb_load_applied_progress(void);
+static bool yb_xact_already_applied(LogicalRepBeginData *begin_data);
+static void yb_record_applied_xact(LogicalRepCommitData *commit_data);
 
 static void DisableSubscriptionAndExit(void);
 
@@ -933,6 +952,20 @@ apply_handle_begin(StringInfo s)
 		 (unsigned long) yb_remote_commit_ht);
 
 	maybe_start_skipping_changes(begin_data.final_lsn);
+
+	/*
+	 * YB: skip a transaction resent after a restart, through the same path as
+	 * subskiplsn, so that its commit is still acknowledged to the publisher.
+	 */
+	if (IsYugaByteEnabled() && !is_skipping_changes() &&
+		!XLogRecPtrIsInvalid(begin_data.final_lsn) &&
+		yb_xact_already_applied(&begin_data))
+	{
+		skip_xact_finish_lsn = begin_data.final_lsn;
+		ereport(LOG,
+				(errmsg("logical replication skips transaction at LSN %X/%X, applied before the worker restarted",
+						LSN_FORMAT_ARGS(skip_xact_finish_lsn))));
+	}
 
 	in_remote_transaction = true;
 
@@ -1681,6 +1714,13 @@ apply_handle_commit_internal(LogicalRepCommitData *commit_data)
 		 */
 		replorigin_session_origin_lsn = commit_data->end_lsn;
 		replorigin_session_origin_timestamp = commit_data->committime;
+
+		/*
+		 * YB: the durable counterpart of the origin update above, which only
+		 * reaches the WAL commit record on PG.
+		 */
+		if (IsYugaByteEnabled())
+			yb_record_applied_xact(commit_data);
 
 		CommitTransactionCommand();
 
@@ -2981,6 +3021,92 @@ yb_set_last_commit_ht(XLogRecPtr ht)
 }
 
 /*
+ * YB: committime is a raw hybrid time only when the publisher has
+ * ysql_yb_use_commit_time_ht_in_replication; otherwise it is a TimestampTz,
+ * which drops the logical component, so distinct commits can compare equal and
+ * cannot identify a transaction.  A TimestampTz stays below 2^52 until 2142; a
+ * hybrid time is far above it.
+ */
+static bool
+yb_is_commit_hybrid_time(TimestampTz committime)
+{
+	return (uint64) committime > ((uint64) 1 << 52);
+}
+
+static void
+yb_load_applied_progress(void)
+{
+	if (yb_applied_progress_loaded)
+		return;
+	(void) YbReadApplyProgress(MySubscription->oid, MyLogicalRepWorker->relid,
+							   &yb_applied_commit_ht, &yb_applied_end_lsn);
+	yb_applied_progress_loaded = true;
+}
+
+/*
+ * YB: whether this transaction was applied before the worker restarted.
+ *
+ * Against PostgreSQL the commit LSN identifies it, exactly as the walsender's
+ * own start-point filter uses it.  Against YugabyteDB the LSN and xid are
+ * counters the virtual WAL recomputes from the slot's restart point on every
+ * reconnect, not identities of their own, so the commit hybrid time is used
+ * instead: the virtual WAL ships everything sharing a commit time as one
+ * transaction, so it strictly increases.
+ */
+static bool
+yb_xact_already_applied(LogicalRepBeginData *begin_data)
+{
+	static bool warned = false;
+
+	if (!yb_publisher_is_yb)
+	{
+		yb_load_applied_progress();
+		return begin_data->final_lsn < yb_applied_end_lsn;
+	}
+
+	if (!yb_is_commit_hybrid_time(begin_data->committime))
+	{
+		if (!warned)
+			ereport(WARNING,
+					(errmsg("cannot detect transactions resent after a restart"),
+					 errdetail("The publisher sends commit times rather than hybrid times."),
+					 errhint("Set ysql_yb_use_commit_time_ht_in_replication on the publisher.")));
+		warned = true;
+		return false;
+	}
+
+	yb_load_applied_progress();
+	return (uint64) begin_data->committime <= yb_applied_commit_ht;
+}
+
+/*
+ * YB: record the transaction being committed as applied.  Must run inside it,
+ * so the progress row commits or aborts together with the applied rows.
+ * commit_ht stays 0 for a PostgreSQL publisher.
+ */
+static void
+yb_record_applied_xact(LogicalRepCommitData *commit_data)
+{
+	uint64		commit_ht = 0;
+
+	if (yb_publisher_is_yb)
+	{
+		if (!yb_is_commit_hybrid_time(commit_data->committime))
+			return;
+		commit_ht = (uint64) commit_data->committime;
+		if (commit_ht <= yb_applied_commit_ht)
+			return;
+	}
+	else if (commit_data->end_lsn <= yb_applied_end_lsn)
+		return;
+
+	YbWriteApplyProgress(MySubscription->oid, MyLogicalRepWorker->relid,
+						 commit_ht, commit_data->end_lsn);
+	yb_applied_commit_ht = commit_ht;
+	yb_applied_end_lsn = commit_data->end_lsn;
+}
+
+/*
  * Apply main loop.
  */
 static void
@@ -4274,8 +4400,26 @@ ApplyWorkerMain(Datum main_arg)
 		if (!OidIsValid(originid))
 			originid = replorigin_create(originname);
 
+		/*
+		 * YB: set the origin from durable progress before resuming from it.
+		 * This node's memory may hold a dropped origin's progress under a
+		 * reused ID - a drop clears it only on the node that runs the drop -
+		 * and resuming from that would skip this subscription's transactions.
+		 * The durable record is the subscription progress table; with no row
+		 * there, start from the slot's confirmed position.
+		 *
+		 * TODO(known limitation): a YB SEQUENCE slot's LSNs are per slot, but
+		 * the progress row survives ALTER SUBSCRIPTION ... SET (slot_name) and
+		 * a slot recreated under the same name.  Seeding a new slot with the
+		 * old slot's end_lsn makes the walsender drop its first transactions
+		 * silently.  Reset the row and origin when the slot changes.
+		 */
 		if (IsYugaByteEnabled())
-			yb_reset_origin_progress(originid);
+		{
+			yb_load_applied_progress();
+			replorigin_advance(originid, yb_applied_end_lsn, InvalidXLogRecPtr,
+							   true /* go backward */ , false /* WAL log */ );
+		}
 
 		replorigin_session_setup(originid);
 		replorigin_session_origin = originid;

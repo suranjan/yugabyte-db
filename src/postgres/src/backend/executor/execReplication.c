@@ -904,11 +904,9 @@ YbExecSimpleRelationInsert(ResultRelInfo *resultRelInfo, EState *estate,
 	slot->tts_tableOid = RelationGetRelid(rel);
 
 	/*
-	 * YB: a conflicting row reports a duplicate key, as on PG, including for a
-	 * transaction resent after a worker restart: no durable apply progress is
-	 * recorded yet, so a restarted worker starts from the slot's confirmed
-	 * position (see ApplyWorkerMain).  TODO: a follow-up diff records progress
-	 * durably so replayed transactions are skipped.
+	 * YB: a conflicting row reports a duplicate key, as on PG.  A transaction
+	 * resent after a restart never gets here: the apply worker skips it using
+	 * the subscription progress table (see yb_xact_already_applied).
 	 */
 	YBCExecuteInsert(rel, slot, ONCONFLICT_NONE);
 

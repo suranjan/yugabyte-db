@@ -76,6 +76,7 @@ DEFINE_test_flag(bool, simulate_catalog_version_refresh_failure, false,
 DEFINE_test_flag(bool, log_catalog_version_cache_events, false,
     "Log cache hit/miss and refresh events for GetYsqlDBCatalogVersion.");
 DECLARE_bool(ysql_yb_enable_listen_notify);
+DECLARE_bool(ysql_yb_enable_pg_subscription);
 
 namespace yb::master {
 
@@ -411,6 +412,11 @@ void YsqlManager::RunBgTasks(const LeaderEpoch& epoch) {
     if (FLAGS_ysql_yb_enable_listen_notify) {
       WARN_NOT_OK(ListenNotifyBgTask(), "Failed to complete LISTEN/NOTIFY background task");
     }
+
+    if (FLAGS_ysql_yb_enable_pg_subscription) {
+      WARN_NOT_OK(
+          SubscriptionProgressBgTask(), "Failed to create the subscription apply progress table");
+    }
   }
 
   StartDdlPostProcessingFailedVerificationRetriggerIfStopped();
@@ -674,6 +680,43 @@ Status YsqlManager::CreateListenNotifyObjects() {
   return ExecuteStatementsAsync(
       kYbSystemDbName, statements, catalog_manager_, failure_warn_prefix,
       &creating_listen_notify_objects_, &created_listen_notify_objects_);
+}
+
+// Logical replication apply workers record what they applied in this table, in the same transaction
+// as the applied rows, so transactions resent after a restart can be skipped (yb_apply_progress.c).
+// relid is 0 for an apply worker and the table's oid for a tablesync worker. The columns must match
+// the hand-built relation in yb_apply_progress.c. Only superusers can read it: the statements run
+// as the internal postgres user and grant nothing.
+Status YsqlManager::SubscriptionProgressBgTask() {
+  DCHECK(FLAGS_enable_ysql);
+
+  if (created_subscription_progress_table_.load(std::memory_order_acquire) ||
+      creating_subscription_progress_table_.load(std::memory_order_acquire)) {
+    return Status::OK();
+  }
+  if (VERIFY_RESULT(catalog_manager_.GetNumLiveTServersForActiveCluster()) == 0) {
+    return Status::OK();
+  }
+  RETURN_NOT_OK(CreateYbSystemDBIfNeeded());
+  if (!yb_system_db_created_.load(std::memory_order_acquire)) {
+    return Status::OK();
+  }
+
+  std::vector<std::string> statements;
+  statements.emplace_back(Format(
+      R"(CREATE TABLE IF NOT EXISTS $0 (
+           subid oid NOT NULL,
+           relid oid NOT NULL,
+           commit_ht bigint NOT NULL,
+           end_lsn pg_lsn NOT NULL,
+           CONSTRAINT $0_pkey PRIMARY KEY ((subid, relid) HASH)
+         ) SPLIT INTO 1 TABLETS)",
+      kPgYbSubscriptionProgressTableName));
+
+  return ExecuteStatementsAsync(
+      kYbSystemDbName, statements, catalog_manager_,
+      "Failed to create the subscription apply progress table",
+      &creating_subscription_progress_table_, &created_subscription_progress_table_);
 }
 
 void YsqlManager::StartDdlPostProcessingFailedVerificationRetriggerIfStopped() {

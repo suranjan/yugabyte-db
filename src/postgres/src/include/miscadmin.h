@@ -302,6 +302,7 @@ extern PGDLLIMPORT bool VacuumCostActive;
 
 extern PGDLLIMPORT char *YbSystemDbName;
 extern PGDLLIMPORT char *PgYbNotificationsTableName;
+extern PGDLLIMPORT char *PgYbSubscriptionProgressTableName;
 extern PGDLLIMPORT char *PgYbNotificationsPublicationName;
 extern PGDLLIMPORT char *YbNotificationsSlotPrefix;
 
