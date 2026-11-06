@@ -49,8 +49,10 @@ start_one()
 	"$YUGABYTED" start \
 		--base_dir="$base_dir" \
 		--advertise_address="$addr" \
-		--master_flags "master_auto_run_initdb=true,TEST_dcheck_for_missing_schema_packing=false" \
+		--master_flags "master_auto_run_initdb=true,TEST_dcheck_for_missing_schema_packing=false,\
+ysql_yb_enable_pg_subscription=true" \
 		--tserver_flags "ysql_yb_enable_replication_commands=true,\
+ysql_yb_enable_pg_subscription=true,\
 ysql_yb_use_commit_time_ht_in_replication=true,\
 ysql_yb_default_replica_identity=$ri,\
 TEST_dcheck_for_missing_schema_packing=false,\
