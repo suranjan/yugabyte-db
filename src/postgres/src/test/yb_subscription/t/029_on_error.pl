@@ -92,18 +92,6 @@ max_prepared_transactions = 10
 ]);
 $node_subscriber->start;
 
-# YB: this test needs the conflicting INSERT to raise an error, both to trigger
-# disable_on_error and to get the finish LSN for ALTER SUBSCRIPTION ... SKIP.
-# YB applies replicated inserts as upserts by default, which would absorb the
-# conflict.  Guarded because the setting does not exist on a PostgreSQL
-# subscriber.
-if ($ENV{YB_SUBSCRIBER_CONNSTR})
-{
-	$node_subscriber->append_conf('postgresql.conf',
-		"yb_pg_subscription_upsert_insert = off");
-	$node_subscriber->reload;
-}
-
 # Initial table setup on both publisher and subscriber. On the subscriber, we
 # create the same tables but with a primary key. Also, insert some data that
 # will conflict with the data replicated from publisher later.
