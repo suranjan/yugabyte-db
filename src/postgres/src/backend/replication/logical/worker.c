@@ -278,14 +278,6 @@ static bool MySubscriptionValid = false;
 bool		in_remote_transaction = false;
 static XLogRecPtr remote_final_lsn = InvalidXLogRecPtr;
 
-/*
- * YB: true when the publisher this worker is connected to is a YugabyteDB
- * instance.  Detected once per connection by yb_detect_publisher_type().
- * Process-local, so a subscription to a PG publisher and one to a YB
- * publisher can coexist; each worker sees its own publisher's type.
- */
-bool		yb_publisher_is_yb = false;
-
 /* fields valid only when processing streamed transaction */
 static bool in_streamed_transaction = false;
 
@@ -3994,65 +3986,6 @@ start_apply(XLogRecPtr origin_startpos)
 	PG_END_TRY();
 }
 
-/*
- * YB: detect whether the publisher on the other end of LogRepWorkerWalRcvConn
- * is a YugabyteDB instance, and set yb_publisher_is_yb accordingly.  Values
- * that are hybrid times on a YB publisher (the CREATE_REPLICATION_SLOT
- * snapshot name, protocol commit times) are ordinary PG values on a
- * PostgreSQL publisher and must not be reinterpreted.
- */
-void
-yb_detect_publisher_type(void)
-{
-	WalRcvExecResult *res;
-	Oid			textoid = TEXTOID;
-	TupleTableSlot *slot;
-	bool		isnull;
-	char	   *version_str;
-
-	yb_publisher_is_yb = false;
-
-	if (!IsYugaByteEnabled())
-		return;
-
-	StartTransactionCommand();
-
-	res = walrcv_exec(LogRepWorkerWalRcvConn,
-					  "SELECT version()",
-					  1, &textoid);
-
-	/*
-	 * Refuse rather than guess: a YB publisher taken for PostgreSQL has its
-	 * hybrid times read as ordinary values, and that failure is silent.  This
-	 * exits the worker, which the launcher then retries, exactly as it does for
-	 * the failed connection its caller reports.
-	 */
-	if (res->status != WALRCV_OK_TUPLES)
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("could not fetch version from publisher: %s", res->err)));
-
-	slot = MakeSingleTupleTableSlot(res->tupledesc, &TTSOpsMinimalTuple);
-	if (!tuplestore_gettupleslot(res->tuplestore, true, false, slot))
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("publisher returned no version")));
-
-	version_str = TextDatumGetCString(slot_getattr(slot, 1, &isnull));
-	Assert(!isnull);
-	yb_publisher_is_yb = (strstr(version_str, "-YB-") != NULL);
-	pfree(version_str);
-
-	ExecDropSingleTupleTableSlot(slot);
-	walrcv_clear_result(res);
-
-	CommitTransactionCommand();
-
-	ereport(LOG,
-			(errmsg("logical replication connected to %s publisher",
-					yb_publisher_is_yb ? "YugabyteDB" : "PostgreSQL")));
-}
-
 /* Logical Replication Apply worker entry point */
 void
 ApplyWorkerMain(Datum main_arg)
@@ -4275,9 +4208,6 @@ ApplyWorkerMain(Datum main_arg)
 		 * does some initializations on the upstream so let's still call it.
 		 */
 		(void) walrcv_identify_system(LogRepWorkerWalRcvConn, &startpointTLI);
-
-		/* YB: detect whether the publisher is YB or PG. */
-		yb_detect_publisher_type();
 
 		/*
 		 * Allocate the origin name in long-lived context for error context

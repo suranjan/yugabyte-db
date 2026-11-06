@@ -83,14 +83,6 @@ extern PGDLLIMPORT LogicalRepWorker *MyLogicalRepWorker;
 
 extern PGDLLIMPORT bool in_remote_transaction;
 
-/*
- * YB: true when the publisher this worker is connected to is a YugabyteDB
- * instance; see yb_detect_publisher_type().
- */
-extern PGDLLIMPORT bool yb_publisher_is_yb;
-
-extern void yb_detect_publisher_type(void);
-
 extern void logicalrep_worker_attach(int slot);
 extern LogicalRepWorker *logicalrep_worker_find(Oid subid, Oid relid,
 												bool only_running);
