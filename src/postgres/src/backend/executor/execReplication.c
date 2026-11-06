@@ -544,16 +544,13 @@ YbExecSimpleRelationInsert(ResultRelInfo *resultRelInfo, EState *estate,
 	slot->tts_tableOid = RelationGetRelid(rel);
 
 	/*
-	 * YB: upsert so a change committed before a crash replays idempotently -
-	 * origin progress is only flushed at checkpoints, so that window is real.
-	 * Only where a blind write is safe (YBIsUpsertUnsafeOnRel is the tree's own
-	 * rule); elsewhere a colliding insert reports the duplicate key, which is
-	 * what makes a genuine divergence visible.
+	 * YB: a conflicting row reports a duplicate key, as on PG.  That includes
+	 * replay of a transaction committed before a crash: YB does not persist
+	 * origin progress with the commit.  TODO: a follow-up diff records the
+	 * applied LSN / commit hybrid time in a separate table, written in the
+	 * apply transaction, so that replayed transactions are skipped.
 	 */
-	YBCExecuteInsert(rel, slot,
-					 (yb_pg_subscription_upsert_insert &&
-					  !YBIsUpsertUnsafeOnRel(rel)) ? ONCONFLICT_YB_REPLACE :
-					 ONCONFLICT_NONE);
+	YBCExecuteInsert(rel, slot, ONCONFLICT_NONE);
 
 	if (YBCRelInfoHasSecondaryIndices(resultRelInfo))
 		recheckIndexes = ExecInsertIndexTuples(resultRelInfo, slot, estate,

@@ -84,9 +84,7 @@ public class TestPgSubscriptionSkipTransaction
   @Override
   protected Map<String, String> getTServerFlags() {
     Map<String, String> flagMap = super.getTServerFlags();
-    // Replicated inserts are upserts by default, which absorbs the conflict this
-    // test needs; and the finish LSN has to be readable from a log file.
-    appendToYsqlPgConf(flagMap, "yb_pg_subscription_upsert_insert=off");
+    // The finish LSN has to be readable from a log file.
     appendToYsqlPgConf(flagMap, "logging_collector=on");
     return flagMap;
   }

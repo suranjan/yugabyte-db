@@ -23,8 +23,8 @@ import org.yb.YBTestRunner;
 
 /**
  * Apply-path cases that turn on the shape of the target relation rather than on
- * the DML itself: whether a conflicting INSERT is absorbed by the upsert or
- * reported, the privilege needed to look the row up at all, and the missing-row
+ * the DML itself: that a conflicting INSERT is reported, the privilege needed
+ * to look the row up at all, and the missing-row
  * report the rows-affected count serves.
  *
  * Separate from TestPgSubscription because that class already runs close to the
@@ -34,13 +34,11 @@ import org.yb.YBTestRunner;
 public class TestPgSubscriptionApplyChecks extends BasePgSubscriptionApplyTest {
 
   /**
-   * A replicated INSERT is an upsert where a blind write is safe, which is what
-   * makes crash replay of an already-applied change idempotent: the row the
-   * publisher sends wins over whatever is there.  No secondary index, no
-   * trigger and no rule, so nothing needs the replaced row's old values.
+   * A replicated INSERT that collides with a diverged local row reports the
+   * duplicate key, as on PG, rather than overwriting the row.
    */
   @Test
-  public void testUpsertOverConflictOnSafeTable() throws Exception {
+  public void testConflictingInsertIsReported() throws Exception {
     createReplicatedTable("t", stmt -> {
       stmt.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)");
     });
@@ -52,16 +50,15 @@ public class TestPgSubscriptionApplyChecks extends BasePgSubscriptionApplyTest {
     }
 
     execOnPublisher("INSERT INTO t VALUES (1, 'from_pub')");
-    waitForRows("SELECT id, val FROM t", Arrays.asList(row("1", "from_pub")));
+
+    waitForApplyError();
+    assertEquals(Arrays.asList(row("1", "local")),
+                 fetchRows(subConn, "SELECT id, val FROM t"));
   }
 
   /**
-   * On a relation where a blind write is unsafe - here, one with secondary
-   * indexes - the upsert is not used, so a replicated INSERT that collides with
-   * a diverged local row reports the duplicate key instead of overwriting it.
-   * That is the only way the divergence becomes visible; the indexes must come
-   * through it consistent, since a half-applied upsert is what would corrupt
-   * them.
+   * The same conflict on a relation with secondary indexes: the indexes must
+   * come through the rejected insert consistent.
    */
   @Test
   public void testConflictingInsertOnIndexedTableIsReported() throws Exception {

@@ -25,7 +25,7 @@ import org.yb.YBTestRunner;
  * End-to-end tests for YugabyteDB logical replication (pg_subscription).
  *
  * Tests the YB-native DML execution path in the apply worker:
- *   - YBCExecuteInsert (with ONCONFLICT_YB_REPLACE)
+ *   - YBCExecuteInsert
  *   - YBCExecuteUpdate (with an empty ModifyTable plan, yb_repl_mt_plan)
  *   - YBCExecuteDelete
  *
@@ -283,31 +283,6 @@ public class TestPgSubscription extends BasePgSubscriptionApplyTest {
     execOnPublisher("DELETE FROM t WHERE id = 1");
     waitForRowCount("t", 0);
   }
-
-  // ----- Group 5: Crash safety / upsert -----
-
-  @Test
-  public void testInsertIdempotency() throws Exception {
-    createReplicatedTable("t", stmt -> {
-      stmt.execute("CREATE TABLE t (id INT PRIMARY KEY, val TEXT)");
-    });
-
-    // Seed a conflicting row directly on the subscriber, so the replicated
-    // plain INSERT below collides with it on the apply side.  A publisher-side
-    // INSERT ... ON CONFLICT would not do: it executes there as an UPDATE and
-    // replicates as an UPDATE message, never reaching the insert-upsert path.
-    try (Statement stmt = subConn.createStatement()) {
-      stmt.execute("INSERT INTO t VALUES (1, 'local')");
-    }
-
-    // The apply worker must upsert over the conflicting row
-    // (ONCONFLICT_YB_REPLACE) instead of wedging on a duplicate-key error --
-    // the same semantics that make crash replay of an already-applied INSERT
-    // idempotent.
-    execOnPublisher("INSERT INTO t VALUES (1, 'from-pub')");
-    waitForRows("SELECT id, val FROM t", Arrays.asList(row("1", "from-pub")));
-  }
-
 
   // ----- Group 6: Bulk operations -----
 
