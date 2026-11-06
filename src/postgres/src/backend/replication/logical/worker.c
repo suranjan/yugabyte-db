@@ -1933,35 +1933,40 @@ apply_handle_update(StringInfo s)
 	{
 		Form_pg_attribute att = TupleDescAttr(remoteslot->tts_tupleDescriptor, i);
 		int			remoteattnum = rel->attrmap->attnums[i];
-		bool		yb_supplied;
+
+		if (!att->attisdropped && remoteattnum >= 0)
+		{
+			Assert(remoteattnum < newtup.ncols);
+			if (newtup.colstatus[remoteattnum] != LOGICALREP_COLUMN_UNCHANGED)
+				target_rte->updatedCols =
+					bms_add_member(target_rte->updatedCols,
+								   i + 1 - yb_minattr);
+		}
+	}
+
+	/*
+	 * YB: a column is "supplied" when this change carries a value for it.  An
+	 * unsupplied column is left out of the write, so its stored value survives,
+	 * but it is NULL in the slot, which ExecConstraints validates whole.
+	 */
+	for (int i = 0; i < remoteslot->tts_tupleDescriptor->natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(remoteslot->tts_tupleDescriptor, i);
+		int			remoteattnum = rel->attrmap->attnums[i];
 
 		if (att->attisdropped)
 			continue;
 
-		/*
-		 * YB: "supplied" means this change carries an actual value for the
-		 * column - it has a counterpart on the publisher and did not arrive
-		 * marked unchanged.  An unsupplied column is left out of the write, so
-		 * its stored value survives, but it is NULL in the slot and the slot is
-		 * validated as a whole (ExecConstraints).  Tracked here rather than in
-		 * a second pass, since this loop already visits every column.
-		 */
-		yb_supplied = (remoteattnum >= 0 &&
-					   newtup.colstatus[remoteattnum] != LOGICALREP_COLUMN_UNCHANGED);
-
-		if (yb_supplied)
+		if (remoteattnum >= 0)
 		{
 			Assert(remoteattnum < newtup.ncols);
-			target_rte->updatedCols =
-				bms_add_member(target_rte->updatedCols,
-							   i + 1 - yb_minattr);
+			if (newtup.colstatus[remoteattnum] != LOGICALREP_COLUMN_UNCHANGED)
+				continue;
 		}
-		else
-		{
-			yb_any_unsupplied = true;
-			if (att->attnotnull)
-				yb_unsupplied_notnull = true;
-		}
+
+		yb_any_unsupplied = true;
+		if (att->attnotnull)
+			yb_unsupplied_notnull = true;
 	}
 
 	/* Build the search tuple. */
