@@ -4559,7 +4559,6 @@ YbGetDdlMode(PlannedStmt *pstmt, ProcessUtilityContext context,
 		case T_AlterObjectSchemaStmt:
 		case T_AlterOpFamilyStmt:
 		case T_AlterOperatorStmt:
-		case T_AlterOwnerStmt:
 		case T_AlterPolicyStmt:
 		case T_AlterPublicationStmt:
 		case T_AlterRoleSetStmt:
@@ -4575,6 +4574,13 @@ YbGetDdlMode(PlannedStmt *pstmt, ProcessUtilityContext context,
 		case T_AlternativeSubPlan:
 		case T_ReassignOwnedStmt:
 		case T_AlterTypeStmt:
+			break;
+
+		case T_AlterOwnerStmt:
+			/* See T_AlterSubscriptionStmt. */
+			if (castNode(AlterOwnerStmt, parsetree)->objectType ==
+				OBJECT_SUBSCRIPTION)
+				is_version_increment = true;
 			break;
 
 		case T_AlterSubscriptionStmt:
@@ -4676,6 +4682,9 @@ YbGetDdlMode(PlannedStmt *pstmt, ProcessUtilityContext context,
 					is_altering_existing_data = true;
 					YBMarkTxnUsesTempRelAndSetTxnId();
 				}
+				/* See T_AlterSubscriptionStmt. */
+				if (stmt->renameType == OBJECT_SUBSCRIPTION)
+					is_version_increment = true;
 				break;
 			}
 
