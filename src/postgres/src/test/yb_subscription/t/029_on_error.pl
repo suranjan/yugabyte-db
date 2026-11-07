@@ -152,16 +152,27 @@ test_skip_lsn($node_publisher, $node_subscriber,
 
 # Test for PREPARE and COMMIT PREPARED. Insert the same data to tbl and
 # PREPARE the transaction, raising an error. Then skip the transaction.
-$node_publisher->safe_psql(
-	'postgres',
-	qq[
+#
+# YB: skipped.  The subscriber cannot apply a PREPARE, so the skip never
+# completes.  The next block expects 4 rows, so replicate this block's row as
+# a plain insert instead.
+SKIP:
+{
+	$node_publisher->safe_psql('postgres', "INSERT INTO tbl VALUES (3, NULL)");
+	$node_publisher->wait_for_catchup('sub');
+	skip 'the YugabyteDB subscriber does not support PREPARE TRANSACTION', 1;
+
+	$node_publisher->safe_psql(
+		'postgres',
+		qq[
 BEGIN;
 INSERT INTO tbl VALUES (1, NULL);
 PREPARE TRANSACTION 'gtx';
 COMMIT PREPARED 'gtx';
 ]);
-test_skip_lsn($node_publisher, $node_subscriber,
-	"(3, NULL)", "3", "test skipping prepare and commit prepared ");
+	test_skip_lsn($node_publisher, $node_subscriber,
+		"(3, NULL)", "3", "test skipping prepare and commit prepared ");
+}
 
 # Test for STREAM COMMIT. Insert enough rows to tbl to exceed the 64kB
 # limit, also raising an error on the subscriber during applying spooled

@@ -288,6 +288,29 @@ sub _reset_conf
 	return;
 }
 
+# Tests built around a feature the YugabyteDB subscriber does not have, so they
+# cannot pass whatever the publisher is.  Report them as skipped, before the
+# reset below touches either cluster, rather than let them die part-way.  Only
+# whole-file gaps belong here; a test that merely touches one gets a copy in t/
+# with just that part skipped (029_on_error).
+my %YB_UNSUPPORTED = (
+	'002_types.pl'           => 'a PRIMARY KEY over an array type',
+	'005_encoding.pl'        => 'a non-UTF8 database encoding',
+	'014_binary.pl'          => 'a PRIMARY KEY over an array type',
+	'021_twophase.pl'        => 'PREPARE TRANSACTION',
+	'023_twophase_stream.pl' => 'PREPARE TRANSACTION');
+
+if ($ENV{YB_SUBSCRIBER_CONNSTR})
+{
+	my ($test) = $0 =~ m{([^/]+)$};
+	if (defined $test && exists $YB_UNSUPPORTED{$test})
+	{
+		require Test::More;
+		Test::More::plan(skip_all =>
+			  "the YugabyteDB subscriber does not support $YB_UNSUPPORTED{$test}");
+	}
+}
+
 # Order matters across nodes: every subscription anywhere has to be gone before
 # the publisher's slots can be dropped, otherwise the slots are still active.
 if ($ENV{YB_SUBSCRIBER_CONNSTR})

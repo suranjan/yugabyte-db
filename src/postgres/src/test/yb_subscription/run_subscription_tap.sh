@@ -86,6 +86,20 @@ if [ "${WORKERS:-0}" -lt 6 ]; then
   echo "    --tserver_flags 'ysql_pg_conf_csv={yb_enable_pg_subscription=on,max_logical_replication_workers=6}'"
 fi
 
+# ExternalNode finds a server's log through pg_current_logfile(), which is empty
+# unless logging_collector is on.  Tests that wait for a publisher log line
+# (001_rep_changes, 031_column_list) then time out instead of failing.
+PUB_LOG=$("$PG_PSQL" "$PG_CONN" -t -A -c \
+	"SELECT CASE WHEN pg_current_logfile() IS NULL THEN ''
+	             WHEN pg_current_logfile() LIKE '/%' THEN pg_current_logfile()
+	             ELSE current_setting('data_directory') || '/' || pg_current_logfile() END" \
+	2>/dev/null || true)
+if [ -z "$PUB_LOG" ] || [ ! -r "$PUB_LOG" ]; then
+  echo "WARNING: the publisher's log is not readable here (${PUB_LOG:-logging_collector is off})."
+  echo "  Tests that wait for a publisher log line (001_rep_changes, 031_column_list) will time out."
+  echo "  Run the publisher on this host with logging_collector = on (a restart)."
+fi
+
 # Resolve each requested test to its YugabyteDB copy when there is one, and to
 # the untouched upstream file otherwise.  With no arguments, run everything.
 resolve()
