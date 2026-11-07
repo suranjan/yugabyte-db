@@ -225,6 +225,18 @@ $node_publisher->safe_psql('postgres',
 $node_publisher->safe_psql('postgres',
 	"ALTER TABLE tab_rowfilter_partitioned_2 ATTACH PARTITION tab_rowfilter_partition DEFAULT"
 );
+# YB: a YugabyteDB publisher has no REPLICA IDENTITY USING INDEX either (#1124),
+# so there the pair becomes the primary key, as on the subscriber below.
+if ($node_publisher->can('is_yb') && $node_publisher->is_yb)
+{
+	$node_publisher->safe_psql('postgres',
+		"CREATE TABLE tab_rowfilter_toast (a text NOT NULL, b text NOT NULL, PRIMARY KEY (a, b))"
+	);
+	$node_publisher->safe_psql('postgres',
+		"ALTER TABLE tab_rowfilter_toast ALTER COLUMN a SET STORAGE EXTERNAL");
+}
+else
+{
 $node_publisher->safe_psql('postgres',
 	"CREATE TABLE tab_rowfilter_toast (a text NOT NULL, b text NOT NULL)");
 $node_publisher->safe_psql('postgres',
@@ -235,6 +247,7 @@ $node_publisher->safe_psql('postgres',
 $node_publisher->safe_psql('postgres',
 	"ALTER TABLE tab_rowfilter_toast REPLICA IDENTITY USING INDEX tab_rowfilter_toast_ri_index"
 );
+}
 $node_publisher->safe_psql('postgres',
 	"CREATE TABLE tab_rowfilter_inherited (a int)");
 $node_publisher->safe_psql('postgres',

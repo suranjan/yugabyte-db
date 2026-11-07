@@ -9,9 +9,11 @@
 # the virtual WAL is initialised, so START_REPLICATION fails outright and the
 # apply worker never gets far enough to sync a table.  Upstream's first check
 # leaves non_existent_pub missing and then waits for sync, which therefore waits
-# forever.  Creating the publication once the warning has been observed lets the
-# stream start while keeping the assertion intact.  The later checks need no
-# such treatment: nothing waits on them.
+# forever.  Creating the publication afterwards does not help: the walsender
+# reads publications as of the slot's restart time, before it existed.  So once
+# the warning has been observed, the subscription drops the missing publication,
+# which keeps the assertion intact.  The later checks need no such treatment:
+# nothing waits on them.
 use strict;
 use warnings;
 use PostgreSQL::Test::Cluster;
@@ -61,11 +63,9 @@ ok( $stderr =~
 	  m/WARNING:  publication "non_existent_pub" does not exist on the publisher/,
 	"Create subscription throws warning for non-existent publication");
 
-# The warning above has already been observed, so the publication has served its
-# purpose as a missing one.  Create it now: a YugabyteDB publisher refuses to
-# start the stream while any of the subscription's publications is missing, and
-# the sync below would never complete.
-$node_publisher->safe_psql('postgres', "CREATE PUBLICATION non_existent_pub")
+# YB: see the comment at the top.
+$node_subscriber->safe_psql('postgres',
+	"ALTER SUBSCRIPTION mysub1 SET PUBLICATION mypub")
   if $yb_publisher;
 
 # Wait for initial table sync to finish.
@@ -80,12 +80,11 @@ ok( $stderr =~
 	"Alter subscription add publication throws warning for non-existent publications"
 );
 
-# Specifying non-existent publication along with set publication.  This one uses
-# a name of its own because non_existent_pub now exists.
+# Specifying non-existent publication along with set publication.
 ($ret, $stdout, $stderr) = $node_subscriber->psql('postgres',
-	"ALTER SUBSCRIPTION mysub1 SET PUBLICATION non_existent_pub3");
+	"ALTER SUBSCRIPTION mysub1 SET PUBLICATION non_existent_pub");
 ok( $stderr =~
-	  m/WARNING:  publication "non_existent_pub3" does not exist on the publisher/,
+	  m/WARNING:  publication "non_existent_pub" does not exist on the publisher/,
 	"Alter subscription set publication throws warning for non-existent publication"
 );
 
