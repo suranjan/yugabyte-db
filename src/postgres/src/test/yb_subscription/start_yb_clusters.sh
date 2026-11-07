@@ -42,6 +42,17 @@ fi
 # image of a row its own uncommitted transaction wrote; without it 015_stream and
 # 016_stream_subxact never get past "Failed to get the beforeimage".
 #
+# DDL inside a transaction block is on by default in release builds and off in
+# debug ones.  Turn it on so a debug build runs the mode that ships: with it off,
+# 017_stream_ddl and 019_stream_subxact_ddl_abort abort on the publisher before
+# anything is replicated.  It comes with object locking for table locks and
+# concurrent DDL, which the flag validators tie to it on the master as well as
+# the tserver, so these are release's defaults as one set.
+ddl_flags="ysql_yb_ddl_transaction_block_enabled=true,\
+enable_object_locking_for_table_locks=true,\
+ysql_enable_concurrent_ddl=true,\
+ysql_yb_enable_ddl_savepoint_support=true"
+#
 # max_logical_replication_workers must be >= 6 for 010_truncate.  wal_sender_timeout
 # is what paces wait_for_catchup, which waits on a keepalive.
 common_conf="yb_enable_pg_subscription=on,max_logical_replication_workers=6,\
@@ -54,13 +65,14 @@ start_one()
 		--base_dir="$base_dir" \
 		--advertise_address="$addr" \
 		--master_flags "master_auto_run_initdb=true,TEST_dcheck_for_missing_schema_packing=false,\
-ysql_yb_enable_pg_subscription=true" \
+ysql_yb_enable_pg_subscription=true,$ddl_flags" \
 		--tserver_flags "ysql_yb_enable_replication_commands=true,\
 ysql_yb_enable_pg_subscription=true,\
 ysql_yb_use_commit_time_ht_in_replication=true,\
 ysql_yb_default_replica_identity=$ri,\
 TEST_dcheck_for_missing_schema_packing=false,\
 cdc_enable_intra_transactional_before_image=true,\
+$ddl_flags,\
 ysql_num_shards_per_tserver=1,\
 ysql_pg_conf_csv={$common_conf,yb_default_replica_identity=$ri$extra}"
 }
