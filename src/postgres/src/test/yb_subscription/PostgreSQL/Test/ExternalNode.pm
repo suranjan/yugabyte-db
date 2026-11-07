@@ -410,6 +410,7 @@ sub connstr
 sub safe_psql
 {
 	my ($self, $dbname, $sql, %params) = @_;
+	$sql = $self->_yb_disable_before_drop($sql);
 	my $connstr = $self->connstr($dbname);
 	my @cmd = ($self->{_psql}, '-XAtq', '-d', $connstr, '-v', 'ON_ERROR_STOP=1', '-f', '-');
 	my ($stdout, $stderr);
@@ -432,6 +433,7 @@ sub safe_psql
 sub psql
 {
 	my ($self, $dbname, $sql, %params) = @_;
+	$sql = $self->_yb_disable_before_drop($sql);
 	my $connstr = $self->connstr($dbname);
 	my @cmd = ($self->{_psql}, '-XAtq', '-d', $connstr, '-f', '-');
 	push @cmd, '-v', 'ON_ERROR_STOP=1' if $params{on_error_stop};
@@ -540,6 +542,28 @@ sub _quote_literal
 	my ($str) = @_;
 	$str =~ s#\'#\'\'#g;
 	return "'$str'";
+}
+
+# YugabyteDB refuses DROP SUBSCRIPTION while the subscription is enabled
+# (subscriptioncmds.c), and the upstream tests drop enabled ones.  Disable it
+# first, in its own statement so the DISABLE commits before the drop.  The DO
+# block keeps DROP SUBSCRIPTION IF EXISTS working for a missing subscription.
+sub _yb_disable_before_drop
+{
+	my ($self, $sql) = @_;
+	return $sql unless defined $sql && $sql =~ /\bDROP\s+SUBSCRIPTION\b/i;
+	return $sql unless $self->_is_yb;
+	$sql =~ s{(\bDROP\s+SUBSCRIPTION\s+(?:IF\s+EXISTS\s+)?("(?:[^"]|"")+"|\w+))}{
+		my ($stmt, $ident) = ($1, $2);
+		my $name = lc($ident);
+		($name = substr($ident, 1, -1)) =~ s/""/"/g if $ident =~ /^"/;
+		my $lit = _quote_literal($name);
+		(my $quoted = $name) =~ s/"/""/g;
+		qq{DO \$yb\$ BEGIN IF EXISTS (SELECT 1 FROM pg_subscription WHERE subname = $lit }
+		  . qq{AND subenabled AND subdbid = (SELECT oid FROM pg_database WHERE datname = current_database())) }
+		  . qq{THEN ALTER SUBSCRIPTION "$quoted" DISABLE; END IF; END \$yb\$;\n$stmt}
+	}gie;
+	return $sql;
 }
 
 # Identify the subscription the way the upstream path does, by application_name:
