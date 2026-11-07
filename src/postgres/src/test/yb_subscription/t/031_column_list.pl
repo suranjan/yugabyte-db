@@ -582,17 +582,27 @@ is( $node_subscriber->safe_psql('postgres', "SELECT * FROM tab7 ORDER BY a"),
 # First, let's create a partitioned table with two partitions, each with
 # a different RI, but a column list not covering all those RI.
 
+# YB: a YugabyteDB publisher does not support REPLICA IDENTITY USING INDEX
+# (#1124).  Every index named below is its table's primary key, so DEFAULT is
+# the same replica identity.
+my %pub_pkey_ri = map {;
+	$_ => ($node_publisher->can('is_yb') && $node_publisher->is_yb)
+	  ? 'DEFAULT'
+	  : "USING INDEX ${_}_pkey"
+} qw(test_part_a_1 test_part_a_2 test_part_b_1 test_part_b_2
+  test_part_c_1 test_part_c_2 test_part_d_1);
+
 $node_publisher->safe_psql(
 	'postgres', qq(
 	CREATE TABLE test_part_a (a int, b int, c int) PARTITION BY LIST (a);
 
 	CREATE TABLE test_part_a_1 PARTITION OF test_part_a FOR VALUES IN (1,2,3,4,5);
 	ALTER TABLE test_part_a_1 ADD PRIMARY KEY (a);
-	ALTER TABLE test_part_a_1 REPLICA IDENTITY USING INDEX test_part_a_1_pkey;
+	ALTER TABLE test_part_a_1 REPLICA IDENTITY $pub_pkey_ri{test_part_a_1};
 
 	CREATE TABLE test_part_a_2 PARTITION OF test_part_a FOR VALUES IN (6,7,8,9,10);
 	ALTER TABLE test_part_a_2 ADD PRIMARY KEY (b);
-	ALTER TABLE test_part_a_2 REPLICA IDENTITY USING INDEX test_part_a_2_pkey;
+	ALTER TABLE test_part_a_2 REPLICA IDENTITY $pub_pkey_ri{test_part_a_2};
 
 	-- initial data, one row in each partition
 	INSERT INTO test_part_a VALUES (1, 3);
@@ -659,11 +669,11 @@ $node_publisher->safe_psql(
 
 	CREATE TABLE test_part_b_1 PARTITION OF test_part_b FOR VALUES IN (1,2,3,4,5);
 	ALTER TABLE test_part_b_1 ADD PRIMARY KEY (a);
-	ALTER TABLE test_part_b_1 REPLICA IDENTITY USING INDEX test_part_b_1_pkey;
+	ALTER TABLE test_part_b_1 REPLICA IDENTITY $pub_pkey_ri{test_part_b_1};
 
 	CREATE TABLE test_part_b_2 PARTITION OF test_part_b FOR VALUES IN (6,7,8,9,10);
 	ALTER TABLE test_part_b_2 ADD PRIMARY KEY (b);
-	ALTER TABLE test_part_b_2 REPLICA IDENTITY USING INDEX test_part_b_2_pkey;
+	ALTER TABLE test_part_b_2 REPLICA IDENTITY $pub_pkey_ri{test_part_b_2};
 
 	-- initial data, one row in each partitions
 	INSERT INTO test_part_b VALUES (1, 1);
@@ -729,11 +739,11 @@ $node_publisher->safe_psql(
 
 	CREATE TABLE test_part_c_1 PARTITION OF test_part_c FOR VALUES IN (1,3);
 	ALTER TABLE test_part_c_1 ADD PRIMARY KEY (a);
-	ALTER TABLE test_part_c_1 REPLICA IDENTITY USING INDEX test_part_c_1_pkey;
+	ALTER TABLE test_part_c_1 REPLICA IDENTITY $pub_pkey_ri{test_part_c_1};
 
 	CREATE TABLE test_part_c_2 PARTITION OF test_part_c FOR VALUES IN (2,4);
 	ALTER TABLE test_part_c_2 ADD PRIMARY KEY (b);
-	ALTER TABLE test_part_c_2 REPLICA IDENTITY USING INDEX test_part_c_2_pkey;
+	ALTER TABLE test_part_c_2 REPLICA IDENTITY $pub_pkey_ri{test_part_c_2};
 
 	-- initial data, one row for each partition
 	INSERT INTO test_part_c VALUES (1, 3, 5);
@@ -837,7 +847,7 @@ $node_publisher->safe_psql(
 
 	CREATE TABLE test_part_d_1 PARTITION OF test_part_d FOR VALUES IN (1,3);
 	ALTER TABLE test_part_d_1 ADD PRIMARY KEY (a);
-	ALTER TABLE test_part_d_1 REPLICA IDENTITY USING INDEX test_part_d_1_pkey;
+	ALTER TABLE test_part_d_1 REPLICA IDENTITY $pub_pkey_ri{test_part_d_1};
 
 	INSERT INTO test_part_d VALUES (1, 2);
 ));
