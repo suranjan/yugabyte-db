@@ -7,11 +7,11 @@
 # (libpqwalreceiver.c), so yboutput - the plugin that does support it - is not
 # reachable through CREATE SUBSCRIPTION at all.
 #
-# The failure is not clean, which is what this test pins down.  The initial COPY
-# succeeds, because copying rows needs no replica identity, and then streaming
-# never starts: the relation stays in state 'f' forever while the worker errors
-# and is restarted every few seconds.  Nothing raises an error to the client, so
-# the only in-band evidence is the error counters in
+# The failure is not clean, which is what this test pins down.  The apply worker
+# errors as soon as it asks for the stream and is restarted every few seconds,
+# and a tablesync worker exits with its apply worker, so not even the initial
+# COPY lands although copying rows needs no replica identity.  Nothing raises
+# an error to the client, so the only in-band evidence is the error counters in
 # pg_stat_subscription_stats.
 #
 # This needs a YugabyteDB publisher; CHANGE does not exist on PostgreSQL.
@@ -55,14 +55,6 @@ $node_subscriber->safe_psql('postgres',
 	"CREATE SUBSCRIPTION tap_sub_change CONNECTION '$publisher_connstr' PUBLICATION tap_pub_change"
 );
 
-# The COPY needs no replica identity, so this much does work.  Deliberately not
-# wait_for_subscription_sync: the relation never reaches 'r', so that would only
-# time out.
-$node_subscriber->poll_query_until('postgres',
-	"SELECT count(*) = 1 FROM tab_change")
-  or die "initial copy of a CHANGE table never arrived";
-pass('initial copy of a CHANGE table reaches the subscriber');
-
 # The error is invisible to the client, so the counters are the contract.
 $node_subscriber->poll_query_until('postgres',
 	"SELECT sum(apply_error_count + sync_error_count) > 0
@@ -72,15 +64,15 @@ $node_subscriber->poll_query_until('postgres',
   or die "no error was recorded for a CHANGE table subscription";
 pass('pg_stat_subscription_stats records the rejected replica identity');
 
-# Streaming never starts, so a change made after the copy is not replicated and
-# the relation does not reach 'r'.  Give the apply worker room to have done it.
+# Neither the copied row nor a later change arrives, and the relation does not
+# reach 'r'.  Give the workers room to have done either.
 $node_publisher->safe_psql('postgres',
 	"INSERT INTO tab_change VALUES (2, 'streamed')");
 sleep 15;
 
 is($node_subscriber->safe_psql('postgres',
 		"SELECT count(*) FROM tab_change"),
-	1, 'changes after the copy are not streamed from a CHANGE table');
+	0, 'nothing is copied or streamed from a CHANGE table');
 
 isnt($node_subscriber->safe_psql('postgres',
 		"SELECT DISTINCT srsubstate FROM pg_subscription_rel r
