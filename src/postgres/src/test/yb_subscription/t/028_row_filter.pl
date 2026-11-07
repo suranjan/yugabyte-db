@@ -81,6 +81,14 @@ $node_subscriber->safe_psql('postgres', "DROP TABLE tab_rf_x");
 #
 # The TABLES IN SCHEMA test is independent of all other test cases so it
 # cleans up after itself.
+#
+# YB: a YugabyteDB publisher rejects FOR TABLES IN SCHEMA ("CREATE/ALTER
+# PUBLICATION SCHEMA not supported yet"), so the case is skipped there.  The
+# body keeps upstream's indentation so it stays diffable.
+SKIP:
+{
+skip 'a YugabyteDB publisher does not support publications FOR TABLES IN SCHEMA', 3
+  if $node_publisher->can('is_yb') && $node_publisher->is_yb;
 
 # create tables pub and sub
 $node_publisher->safe_psql('postgres', "CREATE SCHEMA schema_rf_x");
@@ -175,6 +183,7 @@ $node_subscriber->safe_psql('postgres',
 	"DROP TABLE schema_rf_x.tab_rf_partitioned");
 $node_subscriber->safe_psql('postgres', "DROP TABLE schema_rf_x.tab_rf_x");
 $node_subscriber->safe_psql('postgres', "DROP SCHEMA schema_rf_x");
+}
 
 # Testcase end: TABLES IN SCHEMA
 # ====================================================================

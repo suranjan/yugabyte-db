@@ -300,14 +300,33 @@ my %YB_UNSUPPORTED = (
 	'021_twophase.pl'        => 'PREPARE TRANSACTION',
 	'023_twophase_stream.pl' => 'PREPARE TRANSACTION');
 
-if ($ENV{YB_SUBSCRIBER_CONNSTR})
+# The same for features a YugabyteDB publisher does not have.  A test that only
+# partly depends on one skips just that part in its copy in t/ (013, 028).
+my %YB_PUBLISHER_UNSUPPORTED = (
+	'010_truncate.pl'               => 'replicating TRUNCATE (#29674)',
+	'025_rep_changes_for_schema.pl' => 'publications FOR TABLES IN SCHEMA');
+
 {
 	my ($test) = $0 =~ m{([^/]+)$};
-	if (defined $test && exists $YB_UNSUPPORTED{$test})
+	my $reason;
+	if (!defined $test)
+	{
+	}
+	elsif ($ENV{YB_SUBSCRIBER_CONNSTR} && exists $YB_UNSUPPORTED{$test})
+	{
+		$reason = "the YugabyteDB subscriber does not support $YB_UNSUPPORTED{$test}";
+	}
+	elsif ($ENV{PG_PUBLISHER_CONNSTR}
+		&& exists $YB_PUBLISHER_UNSUPPORTED{$test}
+		&& _run_sql('pub', $TEST_DB, 'SELECT version()') =~ /-YB-/)
+	{
+		$reason =
+		  "a YugabyteDB publisher does not support $YB_PUBLISHER_UNSUPPORTED{$test}";
+	}
+	if (defined $reason)
 	{
 		require Test::More;
-		Test::More::plan(skip_all =>
-			  "the YugabyteDB subscriber does not support $YB_UNSUPPORTED{$test}");
+		Test::More::plan(skip_all => $reason);
 	}
 }
 

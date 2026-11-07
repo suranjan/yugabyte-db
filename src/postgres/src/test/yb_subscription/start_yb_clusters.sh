@@ -38,6 +38,10 @@ else
   SUB_EXTRA=""
 fi
 
+# cdc_enable_intra_transactional_before_image lets a publisher build the before
+# image of a row its own uncommitted transaction wrote; without it 015_stream and
+# 016_stream_subxact never get past "Failed to get the beforeimage".
+#
 # max_logical_replication_workers must be >= 6 for 010_truncate.  wal_sender_timeout
 # is what paces wait_for_catchup, which waits on a keepalive.
 common_conf="yb_enable_pg_subscription=on,max_logical_replication_workers=6,\
@@ -56,6 +60,7 @@ ysql_yb_enable_pg_subscription=true,\
 ysql_yb_use_commit_time_ht_in_replication=true,\
 ysql_yb_default_replica_identity=$ri,\
 TEST_dcheck_for_missing_schema_packing=false,\
+cdc_enable_intra_transactional_before_image=true,\
 ysql_num_shards_per_tserver=1,\
 ysql_pg_conf_csv={$common_conf,yb_default_replica_identity=$ri$extra}"
 }

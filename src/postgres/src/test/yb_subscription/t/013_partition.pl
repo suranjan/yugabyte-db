@@ -314,6 +314,14 @@ $result = $node_subscriber2->safe_psql('postgres', "SELECT a FROM tab1_2");
 is($result, qq(), 'delete from tab1_2 replicated');
 
 # truncate
+#
+# YB: a YugabyteDB publisher does not send TRUNCATE (#29674), so this block is
+# skipped there.  The tables it touches are already empty on every node, which is
+# the state it would leave behind.  Upstream's indentation is kept.
+SKIP:
+{
+skip 'a YugabyteDB publisher does not replicate TRUNCATE (#29674)', 4
+  if $node_publisher->can('is_yb') && $node_publisher->is_yb;
 $node_subscriber1->safe_psql('postgres',
 	"INSERT INTO tab1 (a) VALUES (1), (2), (5)");
 $node_subscriber2->safe_psql('postgres', "INSERT INTO tab1_2 (a) VALUES (2)");
@@ -342,6 +350,7 @@ is($result, qq(), 'truncate of tab1_1 replicated');
 $result =
   $node_subscriber2->safe_psql('postgres', "SELECT a FROM tab1 ORDER BY 1");
 is($result, qq(), 'truncate of tab1 replicated');
+}
 
 # Check that subscriber handles cases where update/delete target tuple
 # is missing.  We have to look for the DEBUG1 log messages about that,
