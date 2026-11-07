@@ -430,6 +430,14 @@ is( $node_subscriber->safe_psql('postgres', "SELECT * FROM tab6 ORDER BY a"),
 	qq(1|44||
 2|66||), 'replication with the original primary key');
 
+# YB: on a YugabyteDB publisher the PRIMARY KEY change rewrites the table, and the
+# rewrite re-sends its existing rows as INSERTs, which the subscriber already has
+# (TestPgSubscriptionPublisherRewrite).  The body keeps upstream's indentation.
+SKIP:
+{
+skip 'a YugabyteDB publisher re-sends rows a table rewrite copies', 1
+  if $node_publisher->can('is_yb') && $node_publisher->is_yb;
+
 # now redefine the constraint - move the primary key to a different column
 # (which is still covered by the column list, though)
 
@@ -468,6 +476,7 @@ is( $node_subscriber->safe_psql('postgres', "SELECT * FROM tab6 ORDER BY a"),
 2|132||
 3|110||),
 	'replication with the modified primary key');
+}
 
 
 # TEST: create a table with a column list, then change the replica
@@ -506,6 +515,14 @@ $node_publisher->wait_for_catchup('sub1');
 is( $node_subscriber->safe_psql('postgres', "SELECT * FROM tab7 ORDER BY a"),
 	qq(1|44||
 2|66||), 'replication with the original primary key');
+
+# YB: on a YugabyteDB publisher the PRIMARY KEY change rewrites the table, and the
+# rewrite re-sends its existing rows as INSERTs, which the subscriber already has
+# (TestPgSubscriptionPublisherRewrite).  The body keeps upstream's indentation.
+SKIP:
+{
+skip 'a YugabyteDB publisher re-sends rows a table rewrite copies', 2
+  if $node_publisher->can('is_yb') && $node_publisher->is_yb;
 
 # now redefine the constraint - move the primary key to a different column
 # (which is not covered by the column list)
@@ -554,6 +571,7 @@ is( $node_subscriber->safe_psql('postgres', "SELECT * FROM tab7 ORDER BY a"),
 3|220||
 4|154||),
 	'replication with the modified primary key');
+}
 
 
 # TEST: partitioned tables (with publish_via_partition_root = false)
