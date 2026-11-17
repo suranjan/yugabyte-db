@@ -43,6 +43,21 @@
 #include "executor/ybModifyTable.h"
 #include "pg_yb_utils.h"
 
+/* YB declarations */
+static HeapTuple YbBuildTriggerTupleFromSlot(TupleTableSlot *searchslot,
+											 bool *shouldFree,
+											 ItemPointer *tid);
+static List *YbExecSimpleRelationInsert(ResultRelInfo *resultRelInfo,
+										EState *estate,
+										TupleTableSlot *slot);
+static List *YbExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo,
+										EState *estate,
+										TupleTableSlot *searchslot,
+										TupleTableSlot *slot);
+static bool YbExecSimpleRelationDelete(ResultRelInfo *resultRelInfo,
+									   EState *estate,
+									   TupleTableSlot *searchslot);
+
 /*
  * Setup a ScanKey for a search in the relation 'rel' for a tuple 'key' that
  * is setup to match 'rel' (*NOT* idxrel!).
@@ -431,320 +446,6 @@ retry:
 }
 
 /*
- * YB: materialize a slot into a HeapTuple for the trigger functions.  They
- * assert exactly one of (tupleid, fdw_trigtuple) is valid and a YB slot has no
- * ctid, so t_self is left invalid and carries the ybctid, as in the normal YB
- * executor path.  *tid points at that t_self; free the tuple if *shouldFree.
- */
-static HeapTuple
-YbBuildTriggerTupleFromSlot(TupleTableSlot *searchslot,
-							bool *shouldFree,
-							ItemPointer *tid)
-{
-	HeapTuple	oldtup;
-
-	/* Materializing, so this either returns a tuple or errors out. */
-	oldtup = ExecFetchSlotHeapTuple(searchslot, true, shouldFree);
-	ItemPointerSetInvalid(&(oldtup->t_self));
-	oldtup->t_tableOid = searchslot->tts_tableOid;
-	HEAPTUPLE_YBCTID(oldtup) = TABLETUPLE_YBCTID(searchslot);
-	*tid = &(oldtup->t_self);
-	return oldtup;
-}
-
-/*
- * YB: return true if any primary key column differs between the old and new
- * tuples of a replicated UPDATE.  updatedCols cannot answer it: on this path it
- * holds every column the publisher sent, which always includes the key.
- */
-static bool
-YbReplPrimaryKeyChanged(Relation rel,
-						TupleTableSlot *old_slot,
-						TupleTableSlot *new_slot)
-{
-	Bitmapset  *pkey = YBGetTablePrimaryKeyBms(rel);
-	AttrNumber	minattr = YBGetFirstLowInvalidAttributeNumber(rel);
-	int			col = -1;
-
-	while ((col = bms_next_member(pkey, col)) >= 0)
-	{
-		AttrNumber	attnum = col + minattr;
-		Form_pg_attribute att;
-		Datum		old_val,
-					new_val;
-		bool		old_null,
-					new_null;
-
-		if (attnum <= 0)
-			continue;			/* system columns (e.g. ybrowid) cannot be
-								 * assigned by the publisher */
-
-		att = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
-		old_val = slot_getattr(old_slot, attnum, &old_null);
-		new_val = slot_getattr(new_slot, attnum, &new_null);
-
-		if (old_null != new_null)
-			return true;
-		if (old_null)
-			continue;
-
-		/*
-		 * YB: the same value carries a 1-byte header from storage and a 4-byte
-		 * one from an input function, so compare payloads.  datumIsEqual on the
-		 * raw datums would call the key changed whenever only the headers
-		 * differ, forcing a needless delete plus insert.
-		 */
-		if (att->attlen == -1)
-		{
-			struct varlena *old_var = PG_DETOAST_DATUM_PACKED(old_val);
-			struct varlena *new_var = PG_DETOAST_DATUM_PACKED(new_val);
-
-			if (VARSIZE_ANY_EXHDR(old_var) != VARSIZE_ANY_EXHDR(new_var) ||
-				memcmp(VARDATA_ANY(old_var), VARDATA_ANY(new_var),
-					   VARSIZE_ANY_EXHDR(new_var)) != 0)
-				return true;
-		}
-		else if (!datumIsEqual(old_val, new_val, att->attbyval, att->attlen))
-			return true;
-	}
-	return false;
-}
-
-/*
- * YB: remove the row's secondary index entries - a DocDB row write does not.
- * oldYbctid must be the storage ybctid: it is a key column of every non-unique
- * index, so a zero would write tombstones keyed on 0 and leave the real entries
- * behind.  The delete leaf gets it as a side effect of YBCExecuteDelete, hence
- * the assert.
- */
-static void
-YbReplDeleteIndexTuples(ResultRelInfo *resultRelInfo, Datum oldYbctid,
-						TupleTableSlot *searchslot, EState *estate)
-{
-	HeapTuple	oldtuple;
-	bool		shouldFree;
-
-	Assert(oldYbctid != 0);
-
-	oldtuple = ExecFetchSlotHeapTuple(searchslot, false, &shouldFree);
-	ExecDeleteIndexTuples(resultRelInfo, oldYbctid, oldtuple,
-						  false /* persist_missing_row */ , estate);
-	if (shouldFree)
-		pfree(oldtuple);
-}
-
-/*
- * YB: apply a replicated INSERT, returning the indexes needing recheck.  Kept
- * out of ExecSimpleRelationInsert so that body stays a one-line branch and
- * merges textually.
- *
- * All three leaves rely on worker.c building a fresh EState per change
- * (create_edata_for_relation / finish_edata), which is what makes the per-tuple
- * allocations safe without explicit pfrees.
- */
-static List *
-YbExecSimpleRelationInsert(ResultRelInfo *resultRelInfo, EState *estate,
-						   TupleTableSlot *slot)
-{
-	Relation	rel = resultRelInfo->ri_RelationDesc;
-	List	   *recheckIndexes = NIL;
-	MemoryContext oldContext;
-
-	oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-	slot->tts_tableOid = RelationGetRelid(rel);
-
-	/*
-	 * YB: a conflicting row reports a duplicate key, as on PG.  That includes
-	 * a transaction resent after any worker restart: YB records no durable
-	 * apply progress yet, so a restarted worker starts from the slot's
-	 * confirmed position (see ApplyWorkerMain).  TODO: a follow-up diff
-	 * records the applied LSN / commit hybrid time in a separate table,
-	 * written in the apply transaction, so that replayed transactions are
-	 * skipped.
-	 */
-	YBCExecuteInsert(rel, slot, ONCONFLICT_NONE);
-
-	if (YBCRelInfoHasSecondaryIndices(resultRelInfo))
-		recheckIndexes = ExecInsertIndexTuples(resultRelInfo, slot, estate,
-											   false, false, NULL, NIL);
-
-	MemoryContextSwitchTo(oldContext);
-	return recheckIndexes;
-}
-
-/*
- * YB: apply has no ModifyTable plan; an empty one makes every plan-derived
- * step in YBCExecuteUpdate a no-op.  Read-only - unconstify at the call site
- * rather than handing out a mutable process-wide plan.
- */
-static const ModifyTable yb_repl_mt_plan = {
-	.plan.type = T_ModifyTable,
-	.operation = CMD_UPDATE,
-};
-
-/*
- * YB: the columns YBCExecuteUpdate may write for a replicated UPDATE.  Key
- * columns are excluded - bound via ybctid, and YBCExecuteUpdate asserts
- * updatedCols names none.  whole_row is the trigger / stored-generated case;
- * spelling the set out beats the InvalidAttrNumber sentinel, which would bind
- * every column including the key.  updatedCols must already be in rel's
- * attribute numbers.
- */
-static Bitmapset *
-YbReplUpdatedCols(Relation rel, Bitmapset *updatedCols, bool whole_row)
-{
-	TupleDesc	desc = RelationGetDescr(rel);
-	AttrNumber	minattr = YBGetFirstLowInvalidAttributeNumber(rel);
-	Bitmapset  *cols = NULL;
-
-	if (!whole_row)
-		cols = bms_copy(updatedCols);
-	else
-		for (int idx = 0; idx < desc->natts; idx++)
-		{
-			AttrNumber	attnum = TupleDescAttr(desc, idx)->attnum;
-
-			if (IsRealYBColumn(rel, attnum))
-				cols = bms_add_member(cols, attnum - minattr);
-		}
-
-	return bms_del_members(cols, YBGetTablePrimaryKeyBms(rel));
-}
-
-/*
- * YB: apply a replicated UPDATE to a DocDB-backed relation, returning the
- * indexes needing recheck.  See YbExecSimpleRelationInsert on why this is a
- * separate function.
- */
-static List *
-YbExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo, EState *estate,
-						   TupleTableSlot *searchslot, TupleTableSlot *slot)
-{
-	Relation	rel = resultRelInfo->ri_RelationDesc;
-	List	   *recheckIndexes = NIL;
-	Bitmapset  *updatedCols;
-	Datum		oldYbctid;
-	bool		target_tuple_fetched;
-	bool		whole_row;
-	MemoryContext oldContext;
-
-	oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-
-	searchslot->tts_tableOid = RelationGetRelid(rel);
-	slot->tts_tableOid = RelationGetRelid(rel);
-	updatedCols = ExecGetUpdatedCols(resultRelInfo, estate);
-
-	/*
-	 * YB: a routed partition has no range table entry of its own, so this
-	 * bitmap is the root's, in the root's attribute numbers.  Upstream
-	 * translates it when ri_RangeTableIndex is zero, but YB gives routed
-	 * partitions the root's index (see ExecInitPartitionInfo), so do it here -
-	 * otherwise a leaf whose numbering differs from the root's, one that has had
-	 * a column dropped, silently keeps those columns' old values.
-	 */
-	if (resultRelInfo->ri_RangeTableIndex != 0 &&
-		resultRelInfo->ri_RootResultRelInfo != NULL &&
-		resultRelInfo->ri_RootToPartitionMap != NULL)
-		updatedCols =
-			execute_attr_map_cols(resultRelInfo->ri_RootToPartitionMap->attrMap,
-								  updatedCols, rel);
-
-	/*
-	 * YB: the bitmap was fixed from the message, but a BEFORE ROW UPDATE trigger
-	 * or ExecComputeStoredGenerated can have changed the slot since.  Both run
-	 * only on the fetched-row path, so every slot value is the row's true value.
-	 */
-	whole_row = ((resultRelInfo->ri_TrigDesc &&
-				  resultRelInfo->ri_TrigDesc->trig_update_before_row) ||
-				 (rel->rd_att->constr &&
-				  rel->rd_att->constr->has_generated_stored));
-	updatedCols = YbReplUpdatedCols(rel, updatedCols, whole_row);
-
-	/*
-	 * YB: a zero ybctid encodes "nothing read this row"; derive it from the key
-	 * columns then.  The old index entries are keyed by this ybctid, so capture
-	 * it from searchslot before the write, never from the new tuple.
-	 */
-	target_tuple_fetched = (TABLETUPLE_YBCTID(searchslot) != 0);
-	if (!target_tuple_fetched)
-		TABLETUPLE_YBCTID(searchslot) =
-			YBCComputeYBTupleIdFromSlot(rel, searchslot);
-	oldYbctid = TABLETUPLE_YBCTID(searchslot);
-
-	if (YbReplPrimaryKeyChanged(rel, searchslot, slot))
-	{
-		/*
-		 * YB: the ybctid is the row's DocDB key, so a key change cannot be
-		 * applied in place - delete plus insert, as ExecUpdateAct routes it.
-		 */
-		YBCExecuteUpdateReplace(rel, searchslot, slot, estate);
-	}
-	else
-		YBCExecuteUpdate(resultRelInfo,
-						 searchslot,
-						 slot,
-						 NULL,	/* oldtuple */
-						 estate,
-						 unconstify(ModifyTable *, &yb_repl_mt_plan),
-						 target_tuple_fetched,
-						 YB_TRANSACTIONAL,
-						 updatedCols,
-						 false);	/* canSetTag */
-
-	if (YBCRelInfoHasSecondaryIndices(resultRelInfo))
-	{
-		YbReplDeleteIndexTuples(resultRelInfo, oldYbctid, searchslot, estate);
-		recheckIndexes = ExecInsertIndexTuples(resultRelInfo, slot, estate,
-											   true, false, NULL, NIL);
-	}
-
-	MemoryContextSwitchTo(oldContext);
-	return recheckIndexes;
-}
-
-/*
- * YB: apply a replicated DELETE to a DocDB-backed relation.  See
- * YbExecSimpleRelationInsert on why this is a separate function.
- */
-static bool
-YbExecSimpleRelationDelete(ResultRelInfo *resultRelInfo, EState *estate,
-						   TupleTableSlot *searchslot)
-{
-	Relation	rel = resultRelInfo->ri_RelationDesc;
-	MemoryContext oldContext;
-	bool		row_deleted;
-
-	oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
-	searchslot->tts_tableOid = RelationGetRelid(rel);
-
-	/*
-	 * YB: the rows-affected count costs a synchronous flush per change and feeds
-	 * only the caller's DEBUG1 missing-row report.  So when that report cannot be
-	 * emitted, derive the ybctid and present the tuple as fetched, which keeps
-	 * the delete batched and stops the count being requested.
-	 */
-	if (TABLETUPLE_YBCTID(searchslot) == 0 &&
-		!message_level_is_interesting(DEBUG1))
-		TABLETUPLE_YBCTID(searchslot) =
-			YBCComputeYBTupleIdFromSlot(rel, searchslot);
-
-	row_deleted = YBCExecuteDelete(rel, searchslot, NIL,
-								   TABLETUPLE_YBCTID(searchslot) != 0,	/* target_tuple_fetched */
-								   YB_TRANSACTIONAL,
-								   false,	/* changingPart */
-								   false,	/* persist_missing_row */
-								   estate);
-
-	if (YBCRelInfoHasSecondaryIndices(resultRelInfo))
-		/* YB: YBCExecuteDelete stored the row's ybctid on searchslot. */
-		YbReplDeleteIndexTuples(resultRelInfo, TABLETUPLE_YBCTID(searchslot),
-								searchslot, estate);
-
-	MemoryContextSwitchTo(oldContext);
-	return row_deleted;
-}
-
-/*
  * Insert tuple represented in the slot to the relation, update the indexes,
  * and execute any constraints and per-row triggers.
  *
@@ -1101,4 +802,292 @@ CheckSubscriptionRelkind(char relkind, const char *nspname,
 				 errmsg("cannot use relation \"%s.%s\" as logical replication target",
 						nspname, relname),
 				 errdetail_relkind_not_supported(relkind)));
+}
+
+/*
+ * YB: materialize a slot into a HeapTuple for the trigger functions.  They
+ * assert exactly one of (tupleid, fdw_trigtuple) is valid and a YB slot has no
+ * ctid, so t_self is left invalid and carries the ybctid, as in the normal YB
+ * executor path.  *tid points at that t_self; free the tuple if *shouldFree.
+ */
+static HeapTuple
+YbBuildTriggerTupleFromSlot(TupleTableSlot *searchslot,
+							bool *shouldFree,
+							ItemPointer *tid)
+{
+	HeapTuple	oldtup;
+
+	/* Materializing, so this either returns a tuple or errors out. */
+	oldtup = ExecFetchSlotHeapTuple(searchslot, true, shouldFree);
+	ItemPointerSetInvalid(&(oldtup->t_self));
+	oldtup->t_tableOid = searchslot->tts_tableOid;
+	HEAPTUPLE_YBCTID(oldtup) = TABLETUPLE_YBCTID(searchslot);
+	*tid = &(oldtup->t_self);
+	return oldtup;
+}
+
+/*
+ * YB: return true if any primary key column differs between the old and new
+ * tuples of a replicated UPDATE.  updatedCols cannot answer it: on this path it
+ * holds every column the publisher sent, which always includes the key.
+ * Compared by image, as the stored and the replicated value of a varlena differ
+ * in header size.
+ */
+static bool
+YbReplPrimaryKeyChanged(Relation rel,
+						TupleTableSlot *old_slot,
+						TupleTableSlot *new_slot)
+{
+	Bitmapset  *pkey = YBGetTablePrimaryKeyBms(rel);
+	AttrNumber	minattr = YBGetFirstLowInvalidAttributeNumber(rel);
+	int			col = -1;
+
+	while ((col = bms_next_member(pkey, col)) >= 0)
+	{
+		AttrNumber	attnum = col + minattr;
+		Form_pg_attribute att = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+		Datum		old_val,
+					new_val;
+		bool		old_null,
+					new_null;
+
+		old_val = slot_getattr(old_slot, attnum, &old_null);
+		new_val = slot_getattr(new_slot, attnum, &new_null);
+
+		if (old_null != new_null ||
+			(!old_null &&
+			 !datum_image_eq(old_val, new_val, att->attbyval, att->attlen)))
+			return true;
+	}
+	return false;
+}
+
+/*
+ * YB: remove the row's secondary index entries - a DocDB row write does not.
+ * oldYbctid must be the storage ybctid: it is a key column of every non-unique
+ * index, so a zero would write tombstones keyed on 0 and leave the real entries
+ * behind.  The delete leaf gets it as a side effect of YBCExecuteDelete, hence
+ * the assert.
+ */
+static void
+YbReplDeleteIndexTuples(ResultRelInfo *resultRelInfo, Datum oldYbctid,
+						TupleTableSlot *searchslot, EState *estate)
+{
+	HeapTuple	oldtuple;
+	bool		shouldFree;
+
+	Assert(oldYbctid != 0);
+
+	oldtuple = ExecFetchSlotHeapTuple(searchslot, false, &shouldFree);
+	ExecDeleteIndexTuples(resultRelInfo, oldYbctid, oldtuple,
+						  false /* persist_missing_row */ , estate);
+	if (shouldFree)
+		pfree(oldtuple);
+}
+
+/*
+ * YB: apply a replicated INSERT, returning the indexes needing recheck.
+ * Separate from ExecSimpleRelationInsert so that body stays a one-line branch
+ * and merges textually.  All three leaves rely on worker.c building a fresh
+ * EState per change (create_edata_for_relation / finish_edata), which makes the
+ * per-tuple allocations safe without pfrees.
+ */
+static List *
+YbExecSimpleRelationInsert(ResultRelInfo *resultRelInfo, EState *estate,
+						   TupleTableSlot *slot)
+{
+	Relation	rel = resultRelInfo->ri_RelationDesc;
+	List	   *recheckIndexes = NIL;
+	MemoryContext oldContext;
+
+	oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+	slot->tts_tableOid = RelationGetRelid(rel);
+
+	/*
+	 * YB: a conflicting row reports a duplicate key, as on PG, including for a
+	 * transaction resent after a worker restart: no durable apply progress is
+	 * recorded yet, so a restarted worker starts from the slot's confirmed
+	 * position (see ApplyWorkerMain).  TODO: a follow-up diff records progress
+	 * durably so replayed transactions are skipped.
+	 */
+	YBCExecuteInsert(rel, slot, ONCONFLICT_NONE);
+
+	if (YBCRelInfoHasSecondaryIndices(resultRelInfo))
+		recheckIndexes = ExecInsertIndexTuples(resultRelInfo, slot, estate,
+											   false, false, NULL, NIL);
+
+	MemoryContextSwitchTo(oldContext);
+	return recheckIndexes;
+}
+
+/*
+ * YB: apply has no ModifyTable plan; an empty one makes every plan-derived
+ * step in YBCExecuteUpdate a no-op.  Read-only - unconstify at the call site
+ * rather than handing out a mutable process-wide plan.
+ */
+static const ModifyTable yb_repl_mt_plan = {
+	.plan.type = T_ModifyTable,
+	.operation = CMD_UPDATE,
+};
+
+/*
+ * YB: the columns YBCExecuteUpdate may write for a replicated UPDATE.  Key
+ * columns are excluded - bound via ybctid, and YBCExecuteUpdate asserts
+ * updatedCols names none.  whole_row is the trigger / stored-generated case;
+ * spelling the set out beats the InvalidAttrNumber sentinel, which would bind
+ * every column including the key.  updatedCols must already be in rel's
+ * attribute numbers.
+ */
+static Bitmapset *
+YbReplUpdatedCols(Relation rel, Bitmapset *updatedCols, bool whole_row)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	AttrNumber	minattr = YBGetFirstLowInvalidAttributeNumber(rel);
+	Bitmapset  *cols = NULL;
+
+	if (!whole_row)
+		cols = bms_copy(updatedCols);
+	else
+		for (int idx = 0; idx < desc->natts; idx++)
+		{
+			AttrNumber	attnum = TupleDescAttr(desc, idx)->attnum;
+
+			if (IsRealYBColumn(rel, attnum))
+				cols = bms_add_member(cols, attnum - minattr);
+		}
+
+	return bms_del_members(cols, YBGetTablePrimaryKeyBms(rel));
+}
+
+/*
+ * YB: apply a replicated UPDATE to a DocDB-backed relation, returning the
+ * indexes needing recheck.  See YbExecSimpleRelationInsert on why this is a
+ * separate function.
+ */
+static List *
+YbExecSimpleRelationUpdate(ResultRelInfo *resultRelInfo, EState *estate,
+						   TupleTableSlot *searchslot, TupleTableSlot *slot)
+{
+	Relation	rel = resultRelInfo->ri_RelationDesc;
+	List	   *recheckIndexes = NIL;
+	Bitmapset  *updatedCols;
+	Datum		oldYbctid;
+	bool		target_tuple_fetched;
+	bool		whole_row;
+	MemoryContext oldContext;
+
+	oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+
+	searchslot->tts_tableOid = RelationGetRelid(rel);
+	slot->tts_tableOid = RelationGetRelid(rel);
+	updatedCols = ExecGetUpdatedCols(resultRelInfo, estate);
+
+	/*
+	 * YB: a routed partition has no range table entry of its own, so this
+	 * bitmap is the root's, in the root's attribute numbers.  Upstream
+	 * translates it when ri_RangeTableIndex is zero, but YB gives routed
+	 * partitions the root's index (see ExecInitPartitionInfo), so do it here -
+	 * otherwise a leaf whose numbering differs from the root's, one that has had
+	 * a column dropped, silently keeps those columns' old values.
+	 */
+	if (resultRelInfo->ri_RangeTableIndex != 0 &&
+		resultRelInfo->ri_RootResultRelInfo != NULL &&
+		resultRelInfo->ri_RootToPartitionMap != NULL)
+		updatedCols =
+			execute_attr_map_cols(resultRelInfo->ri_RootToPartitionMap->attrMap,
+								  updatedCols, rel);
+
+	/*
+	 * YB: the bitmap was fixed from the message, but a BEFORE ROW UPDATE trigger
+	 * or ExecComputeStoredGenerated can have changed the slot since.  Both run
+	 * only on the fetched-row path, so every slot value is the row's true value.
+	 */
+	whole_row = ((resultRelInfo->ri_TrigDesc &&
+				  resultRelInfo->ri_TrigDesc->trig_update_before_row) ||
+				 (rel->rd_att->constr &&
+				  rel->rd_att->constr->has_generated_stored));
+	updatedCols = YbReplUpdatedCols(rel, updatedCols, whole_row);
+
+	/*
+	 * YB: a zero ybctid encodes "nothing read this row"; derive it from the key
+	 * columns then.  The old index entries are keyed by this ybctid, so capture
+	 * it from searchslot before the write, never from the new tuple.
+	 */
+	target_tuple_fetched = (TABLETUPLE_YBCTID(searchslot) != 0);
+	if (!target_tuple_fetched)
+		TABLETUPLE_YBCTID(searchslot) =
+			YBCComputeYBTupleIdFromSlot(rel, searchslot);
+	oldYbctid = TABLETUPLE_YBCTID(searchslot);
+
+	if (YbReplPrimaryKeyChanged(rel, searchslot, slot))
+	{
+		/*
+		 * YB: the ybctid is the row's DocDB key, so a key change cannot be
+		 * applied in place - delete plus insert, as ExecUpdateAct routes it.
+		 */
+		YBCExecuteUpdateReplace(rel, searchslot, slot, estate);
+	}
+	else
+		YBCExecuteUpdate(resultRelInfo,
+						 searchslot,
+						 slot,
+						 NULL,	/* oldtuple */
+						 estate,
+						 unconstify(ModifyTable *, &yb_repl_mt_plan),
+						 target_tuple_fetched,
+						 YB_TRANSACTIONAL,
+						 updatedCols,
+						 false);	/* canSetTag */
+
+	if (YBCRelInfoHasSecondaryIndices(resultRelInfo))
+	{
+		YbReplDeleteIndexTuples(resultRelInfo, oldYbctid, searchslot, estate);
+		recheckIndexes = ExecInsertIndexTuples(resultRelInfo, slot, estate,
+											   true, false, NULL, NIL);
+	}
+
+	MemoryContextSwitchTo(oldContext);
+	return recheckIndexes;
+}
+
+/*
+ * YB: apply a replicated DELETE to a DocDB-backed relation.  See
+ * YbExecSimpleRelationInsert on why this is a separate function.
+ */
+static bool
+YbExecSimpleRelationDelete(ResultRelInfo *resultRelInfo, EState *estate,
+						   TupleTableSlot *searchslot)
+{
+	Relation	rel = resultRelInfo->ri_RelationDesc;
+	MemoryContext oldContext;
+	bool		row_deleted;
+
+	oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
+	searchslot->tts_tableOid = RelationGetRelid(rel);
+
+	/*
+	 * YB: the rows-affected count costs a synchronous flush per change and feeds
+	 * only the caller's DEBUG1 missing-row report.  So when that report cannot be
+	 * emitted, derive the ybctid and present the tuple as fetched, which keeps
+	 * the delete batched and stops the count being requested.
+	 */
+	if (TABLETUPLE_YBCTID(searchslot) == 0 &&
+		!message_level_is_interesting(DEBUG1))
+		TABLETUPLE_YBCTID(searchslot) =
+			YBCComputeYBTupleIdFromSlot(rel, searchslot);
+
+	row_deleted = YBCExecuteDelete(rel, searchslot, NIL,
+								   TABLETUPLE_YBCTID(searchslot) != 0,	/* target_tuple_fetched */
+								   YB_TRANSACTIONAL,
+								   false,	/* changingPart */
+								   false,	/* persist_missing_row */
+								   estate);
+
+	if (YBCRelInfoHasSecondaryIndices(resultRelInfo))
+		/* YB: YBCExecuteDelete stored the row's ybctid on searchslot. */
+		YbReplDeleteIndexTuples(resultRelInfo, TABLETUPLE_YBCTID(searchslot),
+								searchslot, estate);
+
+	MemoryContextSwitchTo(oldContext);
+	return row_deleted;
 }
