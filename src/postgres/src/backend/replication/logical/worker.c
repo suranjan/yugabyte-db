@@ -197,7 +197,6 @@
 #include "utils/timeout.h"
 
 /* YB includes */
-#include "access/yb_special_scans.h"
 #include "executor/ybModifyTable.h"
 #include "pg_yb_utils.h"
 #include "utils/snapmgr.h"
@@ -2226,53 +2225,24 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 	TargetPrivilegesCheck(localrel, ACL_SELECT);
 
 	/*
-	 * YB: with a user-visible primary key the row is addressed by a ybctid
-	 * derived from the replicated key columns, so it can be located by a point
-	 * read - or not read at all.  Relations without a user PK fall through to
-	 * the upstream lookups, which fill the slot's ybctid from storage.
-	 *
-	 * Only sound when the identity in use is the primary key, since with another
-	 * unique index the PK columns may not have been sent at all.  That cannot
-	 * happen while YB rejects REPLICA IDENTITY USING INDEX (#1124), and the
-	 * lookup below refuses it rather than guess.
+	 * YB: write-only fast path.  With a user-visible primary key the row is
+	 * addressed by a ybctid derived from the replicated key columns, so when
+	 * nothing needs its current values it is not read at all: hand back a copy
+	 * of the remote tuple as the located row, and ExecSimpleRelation* computes
+	 * the row key from it.  Only sound when the identity in use is the primary
+	 * key, since with another unique index the key columns may not have been
+	 * sent.  Everything else takes the upstream lookups below.
 	 */
 	if (IsYBRelation(localrel) &&
 		!bms_is_empty(YBGetTablePrimaryKeyBms(localrel)) &&
 		GetRelationIdentityOrPK(localrel) ==
-		RelationGetPrimaryKeyIndex(localrel))
+		RelationGetPrimaryKeyIndex(localrel) &&
+		YbApplyCanSkipLocalFetch(localrel, yb_needs_local_row, yb_operation))
 	{
-		*localslot = ExecInitExtraTupleSlot(estate,
-											RelationGetDescr(localrel),
-											&TTSOpsHeapTuple);
-
-		/*
-		 * YB: write-only fast path.  Hand back a copy of the remote tuple as
-		 * the located row; ExecSimpleRelation* computes the row key from it.
-		 */
-		if (YbApplyCanSkipLocalFetch(localrel, yb_needs_local_row,
-									 yb_operation))
-		{
-			ExecCopySlot(*localslot, remoteslot);
-			slot_getallattrs(*localslot);
-			return true;
-		}
-
-		/*
-		 * YB: fetch the row by its key-derived ybctid.  A miss is a genuine
-		 * "row not found" and gets PG's skip-and-log semantics.
-		 */
-		{
-			Datum		ybctid = YBCComputeYBTupleIdFromSlot(localrel,
-															 remoteslot);
-			HeapTuple	tuple;
-
-			if (!YbFetchHeapTuple(localrel, ybctid, &tuple))
-				return false;
-
-			ExecStoreHeapTuple(tuple, *localslot, true);
-			slot_getallattrs(*localslot);
-			return true;
-		}
+		*localslot = table_slot_create(localrel, &estate->es_tupleTable);
+		ExecCopySlot(*localslot, remoteslot);
+		slot_getallattrs(*localslot);
+		return true;
 	}
 
 	*localslot = table_slot_create(localrel, &estate->es_tupleTable);
@@ -2280,21 +2250,6 @@ FindReplTupleInLocalRel(EState *estate, Relation localrel,
 	idxoid = GetRelationIdentityOrPK(localrel);
 	Assert(OidIsValid(idxoid) ||
 		   (remoterel->replident == REPLICA_IDENTITY_FULL));
-
-	/*
-	 * YB: a valid index here means a YB relation whose replica identity is not
-	 * its primary key - the branch above took every one whose identity is.  YB
-	 * rejects REPLICA IDENTITY USING INDEX (#1124), so that cannot be reached;
-	 * refuse it rather than run the upstream index lookup, which addresses rows
-	 * by ctid.  Supporting #1124 means making that lookup work for DocDB.
-	 */
-	if (IsYBRelation(localrel) && OidIsValid(idxoid))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot apply replicated change to relation \"%s\"",
-						RelationGetRelationName(localrel)),
-				 errdetail("Its replica identity is an index other than the "
-						   "primary key.")));
 
 	if (OidIsValid(idxoid))
 		found = RelationFindReplTupleByIndex(localrel, idxoid,

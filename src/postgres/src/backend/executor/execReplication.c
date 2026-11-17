@@ -158,22 +158,29 @@ retry:
 		found = true;
 		ExecMaterializeSlot(outslot);
 
-		xwait = TransactionIdIsValid(snap.xmin) ?
-			snap.xmin : snap.xmax;
-
-		/*
-		 * If the tuple is locked, wait for locking transaction to finish and
-		 * retry.
-		 */
-		if (TransactionIdIsValid(xwait))
+		/* YB: no locker to wait for; see RelationFindReplTupleSeq. */
+		if (!IsYBRelation(rel))
 		{
-			XactLockTableWait(xwait, NULL, NULL, XLTW_None);
-			goto retry;
+			xwait = TransactionIdIsValid(snap.xmin) ?
+				snap.xmin : snap.xmax;
+
+			/*
+			 * If the tuple is locked, wait for locking transaction to finish and
+			 * retry.
+			 */
+			if (TransactionIdIsValid(xwait))
+			{
+				XactLockTableWait(xwait, NULL, NULL, XLTW_None);
+				goto retry;
+			}
 		}
 	}
 
-	/* Found tuple, try to lock it in the lockmode. */
-	if (found)
+	/*
+	 * Found tuple; lock it unless this is a YB relation.  See
+	 * RelationFindReplTupleSeq.
+	 */
+	if (found && !IsYBRelation(rel))
 	{
 		TM_FailureData tmfd;
 		TM_Result	res;
@@ -520,7 +527,8 @@ YbReplDeleteIndexTuples(ResultRelInfo *resultRelInfo, Datum oldYbctid,
 	Assert(oldYbctid != 0);
 
 	oldtuple = ExecFetchSlotHeapTuple(searchslot, false, &shouldFree);
-	ExecDeleteIndexTuples(resultRelInfo, oldYbctid, oldtuple, estate);
+	ExecDeleteIndexTuples(resultRelInfo, oldYbctid, oldtuple,
+						  false /* persist_missing_row */ , estate);
 	if (shouldFree)
 		pfree(oldtuple);
 }
@@ -724,6 +732,7 @@ YbExecSimpleRelationDelete(ResultRelInfo *resultRelInfo, EState *estate,
 								   TABLETUPLE_YBCTID(searchslot) != 0,	/* target_tuple_fetched */
 								   YB_TRANSACTIONAL,
 								   false,	/* changingPart */
+								   false,	/* persist_missing_row */
 								   estate);
 
 	if (YBCRelInfoHasSecondaryIndices(resultRelInfo))
