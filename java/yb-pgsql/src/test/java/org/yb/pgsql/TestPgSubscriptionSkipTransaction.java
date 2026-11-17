@@ -15,26 +15,16 @@ package org.yb.pgsql;
 import static org.yb.AssertionWrappers.assertEquals;
 import static org.yb.AssertionWrappers.assertNotNull;
 
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.sql.Connection;
-import java.sql.ResultSet;
-import java.sql.Statement;
-import java.util.Map;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import org.junit.After;
-import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.YBTestRunner;
 import org.yb.client.TestUtils;
-import org.yb.util.BuildTypeUtil;
 
 /**
  * Tests ALTER SUBSCRIPTION ... SKIP (lsn = ...) end to end.
@@ -52,11 +42,10 @@ import org.yb.util.BuildTypeUtil;
  */
 @RunWith(value = YBTestRunner.class)
 public class TestPgSubscriptionSkipTransaction
-    extends BasePgSubscriptionLifecycleTest {
+    extends BasePgSubscriptionApplyTest {
   private static final Logger LOG =
       LoggerFactory.getLogger(TestPgSubscriptionSkipTransaction.class);
 
-  private static final long TIMEOUT_MS = BuildTypeUtil.adjustTimeout(120000);
   private static final String TABLE = "skiptest";
 
   /**
@@ -68,104 +57,18 @@ public class TestPgSubscriptionSkipTransaction
       "for replication target relation \"public\\." + TABLE
       + "\" in transaction \\d+, finished at ([0-9A-Fa-f]+/[0-9A-Fa-f]+)");
 
-  private Connection pubConn;
-  private Connection subConn;
-
-  @Override
-  protected int getInitialNumTServers() {
-    return 1;
-  }
-
-  @Override
-  protected int getReplicationFactor() {
-    return 1;
-  }
-
-  @Override
-  protected Map<String, String> getTServerFlags() {
-    Map<String, String> flagMap = super.getTServerFlags();
-    // The finish LSN has to be readable from a log file.
-    appendToYsqlPgConf(flagMap, "logging_collector=on");
-    return flagMap;
-  }
-
-  @Before
-  public void initPubSubDatabases() throws Exception {
-    try (Statement stmt = connection.createStatement()) {
-      stmt.execute("CREATE DATABASE " + PUB_DB);
-      stmt.execute("CREATE DATABASE " + SUB_DB);
-    }
-    pubConn = getConnectionBuilder().withDatabase(PUB_DB).connect();
-    subConn = getConnectionBuilder().withDatabase(SUB_DB).connect();
-  }
-
-  @After
-  public void tearDownSubscription() throws Exception {
-    if (subConn != null && !subConn.isClosed()) {
-      try (Statement stmt = subConn.createStatement()) {
-        stmt.execute("ALTER SUBSCRIPTION " + SUB_NAME + " DISABLE");
-        stmt.execute(
-            "ALTER SUBSCRIPTION " + SUB_NAME + " SET (slot_name = NONE)");
-        stmt.execute("DROP SUBSCRIPTION IF EXISTS " + SUB_NAME);
-      } catch (Exception e) {
-        LOG.warn("Failed to drop subscription during cleanup", e);
+  /** The finish LSN in the most recent of the collected CONTEXT lines, or null. */
+  private static String finishLsn(List<String> lines) {
+    String lsn = null;
+    synchronized (lines) {
+      for (String line : lines) {
+        Matcher m = FINISH_LSN.matcher(line);
+        if (m.find()) {
+          lsn = m.group(1);
+        }
       }
     }
-    if (pubConn != null && !pubConn.isClosed()) {
-      try (Statement stmt = pubConn.createStatement()) {
-        stmt.execute(
-            "SELECT pg_drop_replication_slot(slot_name) "
-            + "FROM pg_replication_slots WHERE plugin = 'pgoutput'");
-      } catch (Exception e) {
-        LOG.warn("Failed to drop replication slots during cleanup", e);
-      }
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  //  Helpers
-  // ---------------------------------------------------------------------------
-
-  private static String scalar(Connection conn, String sql) throws Exception {
-    try (Statement stmt = conn.createStatement();
-         ResultSet rs = stmt.executeQuery(sql)) {
-      return rs.next() ? rs.getString(1) : null;
-    }
-  }
-
-  private static void exec(Connection conn, String sql) throws Exception {
-    try (Statement stmt = conn.createStatement()) {
-      stmt.execute(sql);
-    }
-  }
-
-  /** Absolute path of the log the subscriber node is writing to. */
-  private Path subscriberLogFile() throws Exception {
-    String rel = scalar(subConn, "SELECT pg_current_logfile()");
-    assertNotNull("logging_collector must be on for this test to read the "
-                  + "apply worker's error CONTEXT", rel);
-    Path path = Paths.get(rel);
-    if (!path.isAbsolute()) {
-      path = Paths.get(scalar(subConn, "SHOW data_directory")).resolve(rel);
-    }
-    return path;
-  }
-
-  private static long fileLength(Path path) throws Exception {
-    return Files.exists(path) ? Files.size(path) : 0;
-  }
-
-  /** Everything written to path at or after fromOffset. */
-  private static String logSince(Path path, long fromOffset) throws Exception {
-    if (!Files.exists(path)) {
-      return "";
-    }
-    byte[] all = Files.readAllBytes(path);
-    if (fromOffset >= all.length) {
-      return "";
-    }
-    return new String(all, (int) fromOffset, (int) (all.length - fromOffset),
-                      StandardCharsets.UTF_8);
+    return lsn;
   }
 
   private String subscriptionColumn(String column) throws Exception {
@@ -175,21 +78,8 @@ public class TestPgSubscriptionSkipTransaction
 
   private void waitForSubscriptionColumn(String column, String want)
       throws Exception {
-    TestUtils.waitFor(() -> want.equals(subscriptionColumn(column)),
-                      TIMEOUT_MS, POLL_INTERVAL_MS);
-  }
-
-  private void waitForAllTablesReady() throws Exception {
-    TestUtils.waitFor(() -> {
-      try (Statement stmt = subConn.createStatement();
-           ResultSet rs = stmt.executeQuery(
-               "SELECT count(*) FROM pg_subscription_rel sr "
-               + "JOIN pg_subscription s ON sr.srsubid = s.oid "
-               + "WHERE s.subname = '" + SUB_NAME + "' "
-               + "AND sr.srsubstate != 'r'")) {
-        return rs.next() && rs.getInt(1) == 0;
-      }
-    }, TIMEOUT_MS, POLL_INTERVAL_MS);
+    waitForSubscriberValue("SELECT " + column + "::text FROM pg_subscription "
+                           + "WHERE subname = '" + SUB_NAME + "'", want);
   }
 
   // ---------------------------------------------------------------------------
@@ -204,23 +94,15 @@ public class TestPgSubscriptionSkipTransaction
     // and never reaches the conflict this test is about.
     exec(pubConn, "ALTER TABLE " + TABLE + " REPLICA IDENTITY DEFAULT");
     exec(subConn, "CREATE TABLE " + TABLE + " (i int PRIMARY KEY, t text)");
-    exec(pubConn, "CREATE PUBLICATION " + PUB_NAME + " FOR TABLE " + TABLE);
-
     // disable_on_error so the failed transaction stops the worker cleanly
     // instead of being retried forever, which is what makes SKIP usable.
-    exec(subConn, String.format(
-        "CREATE SUBSCRIPTION %s CONNECTION 'host=%s port=%d dbname=%s user=%s' "
-        + "PUBLICATION %s WITH (copy_data = false, disable_on_error = true)",
-        SUB_NAME, getPgHost(0), getPgPort(0), PUB_DB, TEST_PG_USER, PUB_NAME));
-    waitForAllTablesReady();
+    createPubSubWith("copy_data = false, disable_on_error = true", TABLE);
 
     // Seed the conflict after sync, so it is the apply path that fails and not
     // the initial copy.
     exec(subConn, "INSERT INTO " + TABLE + " VALUES (1, 'local')");
 
-    Path log = subscriberLogFile();
-    long offset = fileLength(log);
-    LOG.info("Reading subscriber log {} from offset {}", log, offset);
+    List<String> contexts = collectPgLogLines("finished at");
 
     exec(pubConn, "BEGIN");
     exec(pubConn, "INSERT INTO " + TABLE + " VALUES (1, 'from-pub')");
@@ -232,17 +114,12 @@ public class TestPgSubscriptionSkipTransaction
     // would pass on an unrelated failure and then time out looking for an LSN
     // that was never going to appear.
     LOG.info("Waiting for the apply worker to report the failed transaction");
-    TestUtils.waitFor(() -> FINISH_LSN.matcher(logSince(log, offset)).find(),
-                      TIMEOUT_MS, POLL_INTERVAL_MS);
+    TestUtils.waitFor(() -> finishLsn(contexts) != null, TIMEOUT_MS, POLL_INTERVAL_MS);
     waitForSubscriptionColumn("subenabled", "false");
 
     // Take the most recent one: the worker may have retried before
     // disable_on_error took effect.
-    String lsn = null;
-    Matcher m = FINISH_LSN.matcher(logSince(log, offset));
-    while (m.find()) {
-      lsn = m.group(1);
-    }
+    String lsn = finishLsn(contexts);
     assertNotNull("apply worker did not report a finish LSN for the failed "
                   + "transaction", lsn);
     LOG.info("Skipping transaction that finished at {}", lsn);
@@ -260,10 +137,7 @@ public class TestPgSubscriptionSkipTransaction
 
     // Replication must resume after the skip.
     exec(pubConn, "INSERT INTO " + TABLE + " VALUES (3, 'after-skip')");
-    TestUtils.waitFor(
-        () -> "1".equals(scalar(subConn, "SELECT count(*) FROM " + TABLE
-                                         + " WHERE i = 3")),
-        TIMEOUT_MS, POLL_INTERVAL_MS);
+    waitForSubscriberValue("SELECT count(*) FROM " + TABLE + " WHERE i = 3", "1");
 
     assertEquals("the conflicting row must keep the subscriber's value",
                  "local", scalar(subConn,

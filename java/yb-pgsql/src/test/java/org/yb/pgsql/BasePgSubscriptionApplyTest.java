@@ -21,7 +21,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
+import java.util.Objects;
 
 import org.junit.After;
 import org.junit.Before;
@@ -34,21 +34,18 @@ import org.yb.util.BuildTypeUtil;
 
 /**
  * Harness shared by the tests that exercise the apply worker's DML path: a
- * publisher database and a subscriber database on one cluster, wired together by
- * a publication and a subscription, and the polling helpers the assertions need.
+ * publisher database and a subscriber database on one single-node cluster, the
+ * publication and subscription between them, and the polling helpers the
+ * assertions need.
  *
- * Split out of TestPgSubscription so that class stays inside the per-class fork
- * timeout - it recreates the cluster for every test method, which puts a hard
- * ceiling on how many tests one class can hold.
+ * The cluster is recreated for every test method, which caps how many tests one
+ * class can hold inside the per-class fork timeout; hence several small classes
+ * over this base.
  */
-public abstract class BasePgSubscriptionApplyTest extends BasePgSQLTest {
+public abstract class BasePgSubscriptionApplyTest extends BasePgSubscriptionLifecycleTest {
   private static final Logger LOG = LoggerFactory.getLogger(BasePgSubscriptionApplyTest.class);
 
-  protected static final String PUB_DB = "pub_db";
-  protected static final String SUB_DB = "sub_db";
-  protected static final long REPLICATION_TIMEOUT_MS =
-      BuildTypeUtil.adjustTimeout(60000);
-  protected static final int REPLICATION_POLL_INTERVAL_MS = 500;
+  protected static final long TIMEOUT_MS = BuildTypeUtil.adjustTimeout(120000);
 
   protected Connection pubConn;
   protected Connection subConn;
@@ -61,28 +58,6 @@ public abstract class BasePgSubscriptionApplyTest extends BasePgSQLTest {
   @Override
   protected int getReplicationFactor() {
     return 1;
-  }
-
-  @Override
-  public int getTestMethodTimeoutSec() {
-    return 300;
-  }
-
-  @Override
-  protected Map<String, String> getTServerFlags() {
-    Map<String, String> flagMap = super.getTServerFlags();
-    appendToYsqlPgConf(flagMap, "yb_enable_pg_subscription=true");
-    flagMap.put("ysql_cdc_active_replication_slot_window_ms", "0");
-    flagMap.put("cdc_send_null_before_image_if_not_exists", "true");
-    flagMap.put("TEST_dcheck_for_missing_schema_packing", "false");
-    return flagMap;
-  }
-
-  @Override
-  protected Map<String, String> getMasterFlags() {
-    Map<String, String> flagMap = super.getMasterFlags();
-    flagMap.put("TEST_dcheck_for_missing_schema_packing", "false");
-    return flagMap;
   }
 
   // ---------------------------------------------------------------------------
@@ -99,48 +74,30 @@ public abstract class BasePgSubscriptionApplyTest extends BasePgSQLTest {
     subConn = getConnectionBuilder().withDatabase(SUB_DB).connect();
   }
 
+  /**
+   * Stops the workers and frees the slots.  Nothing else needs cleaning up: the
+   * cluster is recreated for the next test method.
+   */
   @After
   public void tearDownSubscription() throws Exception {
-    // Tear down subscription first.
-    if (subConn != null && !subConn.isClosed()) {
-      try (Statement stmt = subConn.createStatement()) {
-        stmt.execute("ALTER SUBSCRIPTION test_sub DISABLE");
-        stmt.execute("ALTER SUBSCRIPTION test_sub SET (slot_name = NONE)");
-        stmt.execute("DROP SUBSCRIPTION IF EXISTS test_sub");
-      } catch (Exception e) {
-        LOG.warn("Failed to drop subscription during cleanup", e);
-      }
+    if (pubConn == null || subConn == null) {
+      return;
     }
-    // Drop replication slots on the publisher.
-    if (pubConn != null && !pubConn.isClosed()) {
-      try (Statement stmt = pubConn.createStatement()) {
-        stmt.execute(
-            "SELECT pg_drop_replication_slot(slot_name) "
-            + "FROM pg_replication_slots WHERE plugin = 'pgoutput'");
-      } catch (Exception e) {
-        LOG.warn("Failed to drop replication slots during cleanup", e);
-      }
+    try {
+      exec(subConn, "ALTER SUBSCRIPTION " + SUB_NAME + " DISABLE");
+      exec(subConn, "ALTER SUBSCRIPTION " + SUB_NAME + " SET (slot_name = NONE)");
+      exec(subConn, "DROP SUBSCRIPTION " + SUB_NAME);
+    } catch (Exception e) {
+      LOG.warn("Failed to drop subscription during cleanup", e);
     }
-    // Let the apply worker fully exit before dropping objects it may reference.
-    Thread.sleep(2000);
-    // Drop tables and publication (cheaper than dropping entire databases).
-    if (pubConn != null && !pubConn.isClosed()) {
-      try (Statement stmt = pubConn.createStatement()) {
-        stmt.execute("DROP PUBLICATION IF EXISTS test_pub");
-        stmt.execute("DROP TABLE IF EXISTS t");
-      } catch (Exception e) {
-        LOG.warn("Failed to drop publisher objects during cleanup", e);
-      }
-      pubConn.close();
+    try {
+      // Every slot, so that one a test made by hand goes too.
+      exec(pubConn, "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots");
+    } catch (Exception e) {
+      LOG.warn("Failed to drop replication slots during cleanup", e);
     }
-    if (subConn != null && !subConn.isClosed()) {
-      try (Statement stmt = subConn.createStatement()) {
-        stmt.execute("DROP TABLE IF EXISTS t");
-      } catch (Exception e) {
-        LOG.warn("Failed to drop subscriber table during cleanup", e);
-      }
-      subConn.close();
-    }
+    pubConn.close();
+    subConn.close();
   }
 
   // ---------------------------------------------------------------------------
@@ -191,18 +148,30 @@ public abstract class BasePgSubscriptionApplyTest extends BasePgSQLTest {
    * Split out of createReplicatedTable for the tests that need the two sides to
    * differ - a different replica identity, or different rows.
    */
-  protected void createPubSub(String tableName) throws Exception {
-    try (Statement pub = pubConn.createStatement();
-         Statement sub = subConn.createStatement()) {
-      pub.execute("CREATE PUBLICATION test_pub FOR TABLE " + tableName);
-      sub.execute(String.format(
-          "CREATE SUBSCRIPTION test_sub CONNECTION 'host=%s port=%d dbname=%s user=%s' "
-          + "PUBLICATION test_pub WITH (copy_data = false)",
-          getPgHost(0), getPgPort(0), PUB_DB, ConnectionBuilder.TEST_PG_USER));
-    }
-    // Give the launcher time to detect the new subscription and start the
-    // apply worker before we begin issuing DMLs.
-    Thread.sleep(2000);
+  protected void createPubSub(String... tables) throws Exception {
+    createPubSubWith("copy_data = false", tables);
+  }
+
+  /** As above, with a caller-supplied WITH (...) option list for the subscription. */
+  protected void createPubSubWith(String withOptions, String... tables) throws Exception {
+    exec(pubConn, "CREATE PUBLICATION " + PUB_NAME + " FOR TABLE " + String.join(", ", tables));
+    exec(subConn, createSubscriptionSql(SUB_NAME, PUB_NAME, withOptions));
+    waitForTablesReady(tables.length);
+  }
+
+  /**
+   * Waits until wantReady tables of the subscription are in state 'r'.  Counting
+   * the ready ones rather than the not-ready ones matters: pg_subscription_rel
+   * is empty until the subscription is registered, and "nothing is unready" is
+   * trivially true of an empty table.  DML applied before a table is ready is
+   * skipped as already covered by the copy.
+   */
+  protected void waitForTablesReady(int wantReady) throws Exception {
+    waitForSubscriberValue(
+        "SELECT count(*) FROM pg_subscription_rel sr "
+        + "JOIN pg_subscription s ON sr.srsubid = s.oid "
+        + "WHERE s.subname = '" + SUB_NAME + "' AND sr.srsubstate = 'r'",
+        String.valueOf(wantReady));
   }
 
   // ---------------------------------------------------------------------------
@@ -223,31 +192,25 @@ public abstract class BasePgSubscriptionApplyTest extends BasePgSQLTest {
     TestUtils.waitFor(() -> {
       List<List<String>> actual = fetchRows(subConn, query);
       return sortRows(actual).equals(sortedExpected);
-    }, REPLICATION_TIMEOUT_MS, REPLICATION_POLL_INTERVAL_MS);
+    }, TIMEOUT_MS, POLL_INTERVAL_MS);
 
     List<List<String>> actual = fetchRows(subConn, query);
     assertEquals("Rows on subscriber do not match expected",
                  sortedExpected, sortRows(actual));
   }
 
-  /**
-   * Waits until a scalar count query on the subscriber returns the expected
-   * value.
-   */
+  /** Waits until tableName has expectedCount rows on the subscriber. */
   protected void waitForRowCount(String tableName, int expectedCount) throws Exception {
-    String query = "SELECT count(*) FROM " + tableName;
-    TestUtils.waitFor(() -> {
-      try (Statement stmt = subConn.createStatement();
-           ResultSet rs = stmt.executeQuery(query)) {
-        return rs.next() && rs.getInt(1) == expectedCount;
-      }
-    }, REPLICATION_TIMEOUT_MS, REPLICATION_POLL_INTERVAL_MS);
+    waitForSubscriberValue("SELECT count(*) FROM " + tableName, String.valueOf(expectedCount));
+  }
 
-    try (Statement stmt = subConn.createStatement();
-         ResultSet rs = stmt.executeQuery(query)) {
-      assertTrue(rs.next());
-      assertEquals(expectedCount, rs.getInt(1));
-    }
+  /**
+   * Waits until a single-value query on the subscriber returns want, as text;
+   * null stands for a NULL or for no row.
+   */
+  protected void waitForSubscriberValue(String query, String want) throws Exception {
+    TestUtils.waitFor(() -> Objects.equals(want, scalar(subConn, query)),
+                      TIMEOUT_MS, POLL_INTERVAL_MS);
   }
 
   /**
@@ -280,7 +243,7 @@ public abstract class BasePgSubscriptionApplyTest extends BasePgSQLTest {
   /** Waits until a line collected by collectPgLogLines shows up. */
   protected void waitForLogLine(List<String> collected, String what) throws Exception {
     TestUtils.waitFor(() -> !collected.isEmpty(),
-                      REPLICATION_TIMEOUT_MS, REPLICATION_POLL_INTERVAL_MS);
+                      TIMEOUT_MS, POLL_INTERVAL_MS);
     assertTrue("Expected " + what + " in the apply worker log", !collected.isEmpty());
   }
 
@@ -291,14 +254,14 @@ public abstract class BasePgSubscriptionApplyTest extends BasePgSQLTest {
    * become non-zero; it keeps climbing afterwards.
    */
   protected void waitForApplyError() throws Exception {
-    TestUtils.waitFor(() -> {
-      try (Statement stmt = subConn.createStatement();
-           ResultSet rs = stmt.executeQuery(
-               "SELECT apply_error_count FROM pg_stat_subscription_stats "
-               + "WHERE subname = 'test_sub'")) {
-        return rs.next() && rs.getLong(1) > 0;
-      }
-    }, REPLICATION_TIMEOUT_MS, REPLICATION_POLL_INTERVAL_MS);
+    TestUtils.waitFor(() -> applyErrorCount() > 0, TIMEOUT_MS, POLL_INTERVAL_MS);
+  }
+
+  /** Apply failures the subscription has recorded so far. */
+  protected long applyErrorCount() throws Exception {
+    String count = scalar(subConn, "SELECT apply_error_count FROM pg_stat_subscription_stats "
+                                   + "WHERE subname = '" + SUB_NAME + "'");
+    return count == null ? 0 : Long.parseLong(count);
   }
 
   /** Fetches all rows from a query as lists of strings. */
@@ -333,10 +296,22 @@ public abstract class BasePgSubscriptionApplyTest extends BasePgSQLTest {
     return sorted;
   }
 
-  /** Executes a DML statement on the publisher connection. */
+  /** Executes a statement on the publisher connection. */
   protected void execOnPublisher(String sql) throws Exception {
-    try (Statement stmt = pubConn.createStatement()) {
+    exec(pubConn, sql);
+  }
+
+  protected static void exec(Connection conn, String sql) throws Exception {
+    try (Statement stmt = conn.createStatement()) {
       stmt.execute(sql);
+    }
+  }
+
+  /** First column of the first row as text, or null for a NULL or no row. */
+  protected static String scalar(Connection conn, String sql) throws Exception {
+    try (Statement stmt = conn.createStatement();
+         ResultSet rs = stmt.executeQuery(sql)) {
+      return rs.next() ? rs.getString(1) : null;
     }
   }
 }

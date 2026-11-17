@@ -14,19 +14,11 @@ package org.yb.pgsql;
 
 import static org.yb.AssertionWrappers.assertEquals;
 
-import java.sql.Connection;
-import java.sql.ResultSet;
-import java.sql.Statement;
-
-import org.junit.After;
-import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.YBTestRunner;
-import org.yb.client.TestUtils;
-import org.yb.util.BuildTypeUtil;
 
 /**
  * A column that exists only on the subscriber must keep its stored value when
@@ -46,96 +38,16 @@ import org.yb.util.BuildTypeUtil;
  */
 @RunWith(value = YBTestRunner.class)
 public class TestPgSubscriptionSubscriberOnlyColumn
-    extends BasePgSubscriptionLifecycleTest {
+    extends BasePgSubscriptionApplyTest {
   private static final Logger LOG =
       LoggerFactory.getLogger(TestPgSubscriptionSubscriberOnlyColumn.class);
-
-  private static final long TIMEOUT_MS = BuildTypeUtil.adjustTimeout(120000);
 
   /** No secondary index, so the apply takes the write-only fast path. */
   private static final String FAST = "t_fast";
   /** Secondary index on the subscriber, so the apply fetches the local row. */
   private static final String SLOW = "t_slow";
 
-  private Connection pubConn;
-  private Connection subConn;
-
-  @Override
-  protected int getInitialNumTServers() {
-    return 1;
-  }
-
-  @Override
-  protected int getReplicationFactor() {
-    return 1;
-  }
-
-  @Before
-  public void initPubSubDatabases() throws Exception {
-    try (Statement stmt = connection.createStatement()) {
-      stmt.execute("CREATE DATABASE " + PUB_DB);
-      stmt.execute("CREATE DATABASE " + SUB_DB);
-    }
-    pubConn = getConnectionBuilder().withDatabase(PUB_DB).connect();
-    subConn = getConnectionBuilder().withDatabase(SUB_DB).connect();
-  }
-
-  @After
-  public void tearDownSubscription() throws Exception {
-    if (subConn != null && !subConn.isClosed()) {
-      try (Statement stmt = subConn.createStatement()) {
-        stmt.execute("ALTER SUBSCRIPTION " + SUB_NAME + " DISABLE");
-        stmt.execute(
-            "ALTER SUBSCRIPTION " + SUB_NAME + " SET (slot_name = NONE)");
-        stmt.execute("DROP SUBSCRIPTION IF EXISTS " + SUB_NAME);
-      } catch (Exception e) {
-        LOG.warn("Failed to drop subscription during cleanup", e);
-      }
-    }
-    if (pubConn != null && !pubConn.isClosed()) {
-      try (Statement stmt = pubConn.createStatement()) {
-        stmt.execute(
-            "SELECT pg_drop_replication_slot(slot_name) "
-            + "FROM pg_replication_slots WHERE plugin = 'pgoutput'");
-      } catch (Exception e) {
-        LOG.warn("Failed to drop replication slots during cleanup", e);
-      }
-    }
-  }
-
-  private static String scalar(Connection conn, String sql) throws Exception {
-    try (Statement stmt = conn.createStatement();
-         ResultSet rs = stmt.executeQuery(sql)) {
-      return rs.next() ? rs.getString(1) : null;
-    }
-  }
-
-  private static void exec(Connection conn, String sql) throws Exception {
-    try (Statement stmt = conn.createStatement()) {
-      stmt.execute(sql);
-    }
-  }
-
-  /**
-   * Waits until wantReady tables of the subscription are in state 'r'.  Counting
-   * the ready ones rather than the not-ready ones matters: pg_subscription_rel
-   * is empty until the subscription is registered, and "nothing is unready" is
-   * trivially true of an empty table.
-   */
-  private void waitForTablesReady(int wantReady) throws Exception {
-    TestUtils.waitFor(() -> {
-      try (Statement stmt = subConn.createStatement();
-           ResultSet rs = stmt.executeQuery(
-               "SELECT count(*) FROM pg_subscription_rel sr "
-               + "JOIN pg_subscription s ON sr.srsubid = s.oid "
-               + "WHERE s.subname = '" + SUB_NAME + "' "
-               + "AND sr.srsubstate = 'r'")) {
-        return rs.next() && rs.getInt(1) == wantReady;
-      }
-    }, TIMEOUT_MS, POLL_INTERVAL_MS);
-  }
-
-  private String row(String table) throws Exception {
+  private String abc(String table) throws Exception {
     return scalar(subConn, "SELECT a || '/' || coalesce(b::text, 'NULL') "
                            + "|| '/' || coalesce(c::text, 'NULL') FROM "
                            + table + " ORDER BY a LIMIT 1");
@@ -161,18 +73,12 @@ public class TestPgSubscriptionSubscriberOnlyColumn
     // requires the relation to have no secondary indexes.
     exec(subConn, "CREATE INDEX " + SLOW + "_b_idx ON " + SLOW + " (b)");
 
-    exec(pubConn, "CREATE PUBLICATION " + PUB_NAME + " FOR TABLE " + FAST
-                  + ", " + SLOW);
-    exec(subConn, createSubscriptionSql(SUB_NAME, PUB_NAME, false));
-    waitForTablesReady(2);
+    createPubSub(FAST, SLOW);
 
     for (String table : new String[] {FAST, SLOW}) {
       exec(pubConn, "UPDATE " + table + " SET b = 7 WHERE a = 1");
-      TestUtils.waitFor(
-          () -> "7".equals(scalar(subConn, "SELECT b::text FROM " + table
-                                           + " WHERE a = 1")),
-          TIMEOUT_MS, POLL_INTERVAL_MS);
-      LOG.info("{} after replicated UPDATE (a/b/c): {}", table, row(table));
+      waitForSubscriberValue("SELECT b::text FROM " + table + " WHERE a = 1", "7");
+      LOG.info("{} after replicated UPDATE (a/b/c): {}", table, abc(table));
       assertEquals("an applied UPDATE must not touch a column the publisher "
                    + "never sent (" + table + ")",
                    "42",
@@ -207,15 +113,10 @@ public class TestPgSubscriptionSubscriberOnlyColumn
     // REPLICA and ALWAYS triggers fire.
     exec(subConn, "ALTER TABLE " + table + " ENABLE REPLICA TRIGGER trg");
 
-    exec(pubConn, "CREATE PUBLICATION " + PUB_NAME + " FOR TABLE " + table);
-    exec(subConn, createSubscriptionSql(SUB_NAME, PUB_NAME, false));
-    waitForTablesReady(1);
+    createPubSub(table);
 
     exec(pubConn, "UPDATE " + table + " SET b = 7 WHERE a = 1");
-    TestUtils.waitFor(
-        () -> "7".equals(scalar(subConn, "SELECT b::text FROM " + table
-                                         + " WHERE a = 1")),
-        TIMEOUT_MS, POLL_INTERVAL_MS);
+    waitForSubscriberValue("SELECT b::text FROM " + table + " WHERE a = 1", "7");
 
     assertEquals("a BEFORE UPDATE trigger's assignment must be written even "
                  + "though the publisher never sent that column",
@@ -243,15 +144,10 @@ public class TestPgSubscriptionSubscriberOnlyColumn
     assertEquals("10", scalar(subConn, "SELECT c::text FROM " + table
                                        + " WHERE a = 1"));
 
-    exec(pubConn, "CREATE PUBLICATION " + PUB_NAME + " FOR TABLE " + table);
-    exec(subConn, createSubscriptionSql(SUB_NAME, PUB_NAME, false));
-    waitForTablesReady(1);
+    createPubSub(table);
 
     exec(pubConn, "UPDATE " + table + " SET b = 7 WHERE a = 1");
-    TestUtils.waitFor(
-        () -> "7".equals(scalar(subConn, "SELECT b::text FROM " + table
-                                         + " WHERE a = 1")),
-        TIMEOUT_MS, POLL_INTERVAL_MS);
+    waitForSubscriberValue("SELECT b::text FROM " + table + " WHERE a = 1", "7");
 
     assertEquals("a stored generated column must be recomputed and written "
                  + "when the column it derives from is updated",

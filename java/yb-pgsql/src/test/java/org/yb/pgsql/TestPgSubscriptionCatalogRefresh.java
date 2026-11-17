@@ -14,20 +14,11 @@ package org.yb.pgsql;
 
 import static org.yb.AssertionWrappers.assertEquals;
 
-import java.sql.Connection;
-import java.sql.ResultSet;
-import java.sql.Statement;
 import java.util.Map;
 
-import org.junit.After;
-import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.yb.YBTestRunner;
-import org.yb.client.TestUtils;
-import org.yb.util.BuildTypeUtil;
 
 /**
  * An apply worker must see DDL that another session ran on the subscriber.
@@ -41,25 +32,7 @@ import org.yb.util.BuildTypeUtil;
  * here so release builds, where it defaults on, still cover that mode.
  */
 @RunWith(value = YBTestRunner.class)
-public class TestPgSubscriptionCatalogRefresh extends BasePgSubscriptionLifecycleTest {
-  private static final Logger LOG =
-      LoggerFactory.getLogger(TestPgSubscriptionCatalogRefresh.class);
-
-  private static final long APPLY_TIMEOUT_MS = BuildTypeUtil.adjustTimeout(120000);
-
-  private Connection pubConn;
-  private Connection subConn;
-
-  @Override
-  protected int getInitialNumTServers() {
-    return 1;
-  }
-
-  @Override
-  protected int getReplicationFactor() {
-    return 1;
-  }
-
+public class TestPgSubscriptionCatalogRefresh extends BasePgSubscriptionApplyTest {
   // The validators tie these together on the master and the tserver.
   private static void disableObjectLocking(Map<String, String> flagMap) {
     flagMap.put("enable_object_locking_for_table_locks", "false");
@@ -82,35 +55,6 @@ public class TestPgSubscriptionCatalogRefresh extends BasePgSubscriptionLifecycl
     return flagMap;
   }
 
-  @Before
-  public void initPubSubDatabases() throws Exception {
-    try (Statement stmt = connection.createStatement()) {
-      stmt.execute("CREATE DATABASE " + PUB_DB);
-      stmt.execute("CREATE DATABASE " + SUB_DB);
-    }
-    pubConn = getConnectionBuilder().withDatabase(PUB_DB).connect();
-    subConn = getConnectionBuilder().withDatabase(SUB_DB).connect();
-  }
-
-  @After
-  public void tearDownSubscription() throws Exception {
-    try (Statement sub = subConn.createStatement()) {
-      sub.execute("ALTER SUBSCRIPTION " + SUB_NAME + " DISABLE");
-      sub.execute("ALTER SUBSCRIPTION " + SUB_NAME + " SET (slot_name = NONE)");
-      sub.execute("DROP SUBSCRIPTION IF EXISTS " + SUB_NAME);
-    } catch (Exception e) {
-      LOG.warn("Failed to drop subscription during cleanup", e);
-    }
-    try (Statement pub = pubConn.createStatement()) {
-      pub.execute("SELECT pg_drop_replication_slot(slot_name) "
-                  + "FROM pg_replication_slots WHERE plugin = 'pgoutput'");
-    } catch (Exception e) {
-      LOG.warn("Failed to drop replication slots during cleanup", e);
-    }
-    pubConn.close();
-    subConn.close();
-  }
-
   /** A subscriber-local TRUNCATE rewrites the table under a new DocDB id. */
   @Test
   public void testApplyAfterLocalTableRewrite() throws Exception {
@@ -124,24 +68,17 @@ public class TestPgSubscriptionCatalogRefresh extends BasePgSubscriptionLifecycl
   }
 
   private void checkApplyAfterLocalDdl(String localDdl) throws Exception {
-    try (Statement pub = pubConn.createStatement();
-         Statement sub = subConn.createStatement()) {
-      pub.execute("CREATE TABLE t (k int PRIMARY KEY, v text)");
-      sub.execute("CREATE TABLE t (k int PRIMARY KEY, v text)");
-      // YB tables default to CHANGE, which pgoutput refuses to stream.
-      pub.execute("ALTER TABLE t REPLICA IDENTITY DEFAULT");
-      pub.execute("CREATE PUBLICATION " + PUB_NAME + " FOR TABLE t");
-      sub.execute(createSubscriptionSql(SUB_NAME, PUB_NAME, false /* copyData */));
-    }
+    // YB tables default to CHANGE, which pgoutput refuses to stream.
+    createReplicatedTable("t", "DEFAULT", stmt -> {
+      stmt.execute("CREATE TABLE t (k int PRIMARY KEY, v text)");
+    });
 
     // Apply one row first, so the worker has the table open and cached.
     insertOnPublisherAndWait(1);
     int pid = applyWorkerPid(subConn, SUB_NAME);
     long errorsBefore = applyErrorCount();
 
-    try (Statement sub = subConn.createStatement()) {
-      sub.execute(localDdl);
-    }
+    exec(subConn, localDdl);
     // Let the tserver learn the new catalog version, so the worker's next
     // transaction can see that it moved.
     waitForTServerHeartbeat();
@@ -154,24 +91,7 @@ public class TestPgSubscriptionCatalogRefresh extends BasePgSubscriptionLifecycl
   }
 
   private void insertOnPublisherAndWait(int k) throws Exception {
-    try (Statement pub = pubConn.createStatement()) {
-      pub.execute("INSERT INTO t (k, v) VALUES (" + k + ", 'v" + k + "')");
-    }
-    TestUtils.waitFor(() -> {
-      try (Statement sub = subConn.createStatement();
-           ResultSet rs = sub.executeQuery("SELECT count(*) FROM t WHERE k = " + k)) {
-        return rs.next() && rs.getInt(1) == 1;
-      }
-    }, APPLY_TIMEOUT_MS, POLL_INTERVAL_MS);
-  }
-
-  private long applyErrorCount() throws Exception {
-    try (Statement sub = subConn.createStatement();
-         ResultSet rs = sub.executeQuery(
-             "SELECT apply_error_count FROM pg_stat_subscription_stats s "
-             + "JOIN pg_subscription p ON p.oid = s.subid "
-             + "WHERE p.subname = '" + SUB_NAME + "'")) {
-      return rs.next() ? rs.getLong(1) : 0;
-    }
+    execOnPublisher("INSERT INTO t (k, v) VALUES (" + k + ", 'v" + k + "')");
+    waitForSubscriberValue("SELECT count(*) FROM t WHERE k = " + k, "1");
   }
 }

@@ -14,19 +14,11 @@ package org.yb.pgsql;
 
 import static org.yb.AssertionWrappers.assertEquals;
 
-import java.sql.Connection;
-import java.sql.ResultSet;
-import java.sql.Statement;
-
-import org.junit.After;
-import org.junit.Before;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.YBTestRunner;
-import org.yb.client.TestUtils;
-import org.yb.util.BuildTypeUtil;
 
 /**
  * Applying an UPDATE that omits columns, under REPLICA IDENTITY CHANGE decoded
@@ -49,11 +41,10 @@ import org.yb.util.BuildTypeUtil;
  */
 @RunWith(value = YBTestRunner.class)
 public class TestPgSubscriptionYbOutputChange
-    extends BasePgSubscriptionLifecycleTest {
+    extends BasePgSubscriptionApplyTest {
   private static final Logger LOG =
       LoggerFactory.getLogger(TestPgSubscriptionYbOutputChange.class);
 
-  private static final long TIMEOUT_MS = BuildTypeUtil.adjustTimeout(60000);
   private static final String SLOT = "yb_change_slot";
 
   /** No secondary index, so the apply takes the write-only fast path. */
@@ -61,66 +52,7 @@ public class TestPgSubscriptionYbOutputChange
   /** Secondary index on the subscriber, so the apply fetches the local row. */
   private static final String SLOW = "t_slow";
 
-  private Connection pubConn;
-  private Connection subConn;
-
-  @Override
-  protected int getInitialNumTServers() {
-    return 1;
-  }
-
-  @Override
-  protected int getReplicationFactor() {
-    return 1;
-  }
-
-  @Before
-  public void initPubSubDatabases() throws Exception {
-    try (Statement stmt = connection.createStatement()) {
-      stmt.execute("CREATE DATABASE " + PUB_DB);
-      stmt.execute("CREATE DATABASE " + SUB_DB);
-    }
-    pubConn = getConnectionBuilder().withDatabase(PUB_DB).connect();
-    subConn = getConnectionBuilder().withDatabase(SUB_DB).connect();
-  }
-
-  @After
-  public void tearDownSubscription() throws Exception {
-    if (subConn != null && !subConn.isClosed()) {
-      try (Statement stmt = subConn.createStatement()) {
-        stmt.execute("ALTER SUBSCRIPTION " + SUB_NAME + " DISABLE");
-        stmt.execute(
-            "ALTER SUBSCRIPTION " + SUB_NAME + " SET (slot_name = NONE)");
-        stmt.execute("DROP SUBSCRIPTION IF EXISTS " + SUB_NAME);
-      } catch (Exception e) {
-        LOG.warn("Failed to drop subscription during cleanup", e);
-      }
-    }
-    if (pubConn != null && !pubConn.isClosed()) {
-      try (Statement stmt = pubConn.createStatement()) {
-        // Covers the hand-made yboutput slot as well as any pgoutput slot.
-        stmt.execute("SELECT pg_drop_replication_slot(slot_name) "
-                     + "FROM pg_replication_slots");
-      } catch (Exception e) {
-        LOG.warn("Failed to drop replication slots during cleanup", e);
-      }
-    }
-  }
-
-  private static String scalar(Connection conn, String sql) throws Exception {
-    try (Statement stmt = conn.createStatement();
-         ResultSet rs = stmt.executeQuery(sql)) {
-      return rs.next() ? rs.getString(1) : null;
-    }
-  }
-
-  private static void exec(Connection conn, String sql) throws Exception {
-    try (Statement stmt = conn.createStatement()) {
-      stmt.execute(sql);
-    }
-  }
-
-  private String row(String table) throws Exception {
+  private String abc(String table) throws Exception {
     return scalar(subConn, "SELECT a || '/' || coalesce(b::text, 'NULL') "
                            + "|| '/' || coalesce(c::text, 'NULL') FROM "
                            + table + " WHERE a = 1");
@@ -134,7 +66,7 @@ public class TestPgSubscriptionYbOutputChange
                              + "FROM pg_subscription_rel sr "
                              + "JOIN pg_subscription s ON sr.srsubid = s.oid "
                              + "WHERE s.subname = '" + SUB_NAME + "'"),
-             row(FAST), row(SLOW));
+             abc(FAST), abc(SLOW));
     LOG.info("[{}] apply_error_count={} sync_error_count={}", when,
              scalar(subConn, "SELECT apply_error_count::text "
                              + "FROM pg_stat_subscription_stats "
@@ -142,19 +74,6 @@ public class TestPgSubscriptionYbOutputChange
              scalar(subConn, "SELECT sync_error_count::text "
                              + "FROM pg_stat_subscription_stats "
                              + "WHERE subname = '" + SUB_NAME + "'"));
-  }
-
-  private void waitForTablesReady(int wantReady) throws Exception {
-    TestUtils.waitFor(() -> {
-      try (Statement stmt = subConn.createStatement();
-           ResultSet rs = stmt.executeQuery(
-               "SELECT count(*) FROM pg_subscription_rel sr "
-               + "JOIN pg_subscription s ON sr.srsubid = s.oid "
-               + "WHERE s.subname = '" + SUB_NAME + "' "
-               + "AND sr.srsubstate = 'r'")) {
-        return rs.next() && rs.getInt(1) == wantReady;
-      }
-    }, TIMEOUT_MS, POLL_INTERVAL_MS);
   }
 
   @Test
@@ -196,13 +115,9 @@ public class TestPgSubscriptionYbOutputChange
                  scalar(pubConn, "SELECT plugin FROM pg_replication_slots "
                                  + "WHERE slot_name = '" + SLOT + "'"));
 
-    exec(subConn, String.format(
-        "CREATE SUBSCRIPTION %s CONNECTION 'host=%s port=%d dbname=%s user=%s' "
-        + "PUBLICATION %s WITH (copy_data = false, create_slot = false, "
-        + "slot_name = '%s')",
-        SUB_NAME, getPgHost(0), getPgPort(0), PUB_DB, TEST_PG_USER, PUB_NAME,
-        SLOT));
-
+    exec(subConn, createSubscriptionSql(
+        SUB_NAME, PUB_NAME,
+        "copy_data = false, create_slot = false, slot_name = '" + SLOT + "'"));
     try {
       waitForTablesReady(2);
     } catch (Exception e) {
@@ -217,10 +132,7 @@ public class TestPgSubscriptionYbOutputChange
 
     try {
       for (String table : new String[] {FAST, SLOW}) {
-        TestUtils.waitFor(
-            () -> "7".equals(scalar(subConn, "SELECT b::text FROM " + table
-                                             + " WHERE a = 1")),
-            TIMEOUT_MS, POLL_INTERVAL_MS);
+        waitForSubscriberValue("SELECT b::text FROM " + table + " WHERE a = 1", "7");
       }
     } catch (Exception e) {
       logState("UPDATE never applied");

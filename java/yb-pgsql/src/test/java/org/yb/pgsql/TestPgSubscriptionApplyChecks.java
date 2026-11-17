@@ -265,7 +265,7 @@ public class TestPgSubscriptionApplyChecks extends BasePgSubscriptionApplyTest {
         + "JOIN pg_subscription sub ON s.external_id = 'pg_' || sub.oid "
         + "WHERE sub.subname = 'test_sub' AND s.remote_lsn > '" + lsn + "'";
     TestUtils.waitFor(() -> !fetchRows(subConn, query).isEmpty(),
-                      REPLICATION_TIMEOUT_MS, REPLICATION_POLL_INTERVAL_MS);
+                      TIMEOUT_MS, POLL_INTERVAL_MS);
     return fetchRows(subConn, query).get(0).get(0);
   }
 }
