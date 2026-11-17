@@ -124,7 +124,6 @@
 #include "postmaster/interrupt.h"
 #include "replication/origin.h"
 #include "replication/slot.h"
-#include "replication/worker_internal.h"
 #ifndef HAVE_GETRUSAGE
 #include "rusagestub.h"
 #endif
@@ -2480,6 +2479,8 @@ bool		yb_whitelist_extra_stmts_for_pl_speculative_execution = false;
  */
 
 bool		yb_debug_log_docdb_error_backtrace = false;
+
+bool		yb_keep_docdb_error_context = false;
 
 bool		yb_debug_original_backtrace_format = false;
 
@@ -11634,16 +11635,7 @@ HandleYBStatusAtErrorLevelImpl(YbcStatus status, int elevel, const char *text_do
 		YBCFreeStatus(status);
 		yb_errapply_yb_status(&status_data, 1);
 		errcode(pg_err_code);
-
-		/*
-		 * DocDB errors hide the PG error context, except in a logical
-		 * replication worker: there the context is the only report of which
-		 * change failed, and it carries the finish LSN that ALTER SUBSCRIPTION
-		 * ... SKIP needs.  Without it a conflict raised by storage - a
-		 * duplicate key, say - is unskippable, because nothing ever prints the
-		 * LSN to skip.
-		 */
-		errhidecontext(MyLogicalRepWorker == NULL);
+		errhidecontext(!yb_keep_docdb_error_context);
 		if (yb_debug_log_docdb_error_backtrace)
 			errbacktrace();
 		errfinish(filename, lineno, funcname);

@@ -4258,43 +4258,6 @@ ybc_heap_getnextslot(TableScanDesc tsdesc, ScanDirection direction,
 	}
 }
 
-/*
- * Rebuilds a plain scan: yb_options are not kept on the descriptor, and only
- * scans opened without them are rescanned (logical replication apply).
- */
-void
-ybc_heap_rescan(TableScanDesc tsdesc, ScanKey key)
-{
-	YbTableScanDesc ybDesc = (YbTableScanDesc) tsdesc;
-
-	Assert(PointerIsValid(ybDesc->ybscan));
-
-	/* Honor new scan keys the way heap_rescan does. */
-	if (key != NULL)
-		tsdesc->rs_key = key;
-
-	/*
-	 * The paging state lives in the pggate handle, so recreate the scan the
-	 * way other YB rescans do (see ybcinrescan); merely re-executing the old
-	 * handle would resume after the rows already fetched.
-	 */
-	ybc_free_ybscan(ybDesc->ybscan);
-	ybDesc->ybscan = YbBeginScan(tsdesc->rs_rd,
-								 NULL,	/* index */
-								 false, /* xs_want_itup */
-								 tsdesc->rs_nkeys,
-								 tsdesc->rs_key,
-								 NULL,	/* pg_scan_plan */
-								 NULL,	/* rel_pushdown */
-								 NULL,	/* idx_pushdown */
-								 NULL,	/* aggrefs */
-								 0, /* distinct_prefixlen */
-								 NULL,	/* exec_params */
-								 false, /* is_internal_scan */
-								 false);	/* fetch_ybctids_only */
-	Assert(!YbNeedsPgRecheck(ybDesc->ybscan));
-}
-
 void
 ybc_heap_endscan(TableScanDesc tsdesc)
 {

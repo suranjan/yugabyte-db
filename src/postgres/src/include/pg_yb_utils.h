@@ -790,6 +790,13 @@ extern bool yb_enable_new_relation_fastpath_write_in_txn_blocks;
 /* Add stacktrace information to errors received from DocDB/PgGate. */
 extern bool yb_debug_log_docdb_error_backtrace;
 
+/*
+ * Keep the PG error context on errors received from DocDB, which hide it by
+ * default.  Not a GUC: set by a process whose context is the only report of
+ * what it was doing, such as a logical replication worker.
+ */
+extern bool yb_keep_docdb_error_context;
+
 /* Use Postgres or Yugabyte stacktrace formatting. */
 extern bool yb_debug_original_backtrace_format;
 

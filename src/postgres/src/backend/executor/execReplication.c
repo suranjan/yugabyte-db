@@ -328,7 +328,9 @@ RelationFindReplTupleSeq(Relation rel, LockTupleMode lockmode,
 retry:
 	found = false;
 
-	table_rescan(scan, NULL);
+	/* YB: the scan was just begun and is never retried (see below). */
+	if (!IsYBRelation(rel))
+		table_rescan(scan, NULL);
 
 	/* Try to find the tuple */
 	while (table_scan_getnextslot(scan, ForwardScanDirection, scanslot))

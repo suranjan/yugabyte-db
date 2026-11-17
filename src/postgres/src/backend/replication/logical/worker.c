@@ -366,12 +366,6 @@ static bool FindReplTupleInLocalRel(EState *estate, Relation localrel,
 									TupleTableSlot **localslot,
 									bool yb_needs_local_row,
 									CmdType yb_operation);
-static bool YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel,
-									  bool has_oldtup,
-									  LogicalRepTupleData *oldtup,
-									  LogicalRepTupleData *newtup,
-									  bool any_unsupplied,
-									  bool unsupplied_notnull);
 static void apply_handle_tuple_routing(ApplyExecutionData *edata,
 									   TupleTableSlot *remoteslot,
 									   LogicalRepTupleData *newtup,
@@ -396,6 +390,17 @@ static inline void reset_apply_error_context_info(void);
 /* YB declarations */
 static void yb_force_subscription_reread(void);
 static void yb_apply_worker_onexit(int code, Datum arg);
+static bool YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel,
+									  bool has_oldtup,
+									  LogicalRepTupleData *oldtup,
+									  LogicalRepTupleData *newtup,
+									  bool any_unsupplied,
+									  bool unsupplied_notnull);
+static bool YbReplUpdateChangesKey(LogicalRepRelMapEntry *rel,
+									   LogicalRepTupleData *oldtup,
+									   LogicalRepTupleData *newtup);
+static bool YbApplyCanSkipLocalFetch(Relation localrel, bool needs_local_row,
+									  CmdType operation);
 
 /*
  * YB: the shared catalog version read just before this worker last read its
@@ -1991,133 +1996,6 @@ apply_handle_update(StringInfo s)
 }
 
 /*
- * Copy a virtual tuple slot into a new heap tuple slot.  Used when applying
- * changes to YB relations, where the executor expects a heap slot for
- * slot_getattr() / ybctid computation.
- */
-static TupleTableSlot *
-CopyVirtualSlotToHeapSlot(EState *estate, TupleTableSlot *virtualslot,
-						  TupleDesc tupdesc)
-{
-	TupleTableSlot *heapslot = ExecInitExtraTupleSlot(estate, tupdesc,
-													  &TTSOpsHeapTuple);
-
-	return ExecCopySlot(heapslot, virtualslot);
-}
-
-/*
- * YB: must this UPDATE read the local row, or can it write blind?
- *
- * Only an unsupplied column forces a read: YBCExecuteUpdate stores only
- * updatedCols, so such a column keeps its stored value unread - but it is NULL
- * in the slot, which three things then expose.  A key change becomes a delete
- * plus insert that stores the whole slot, persisting that NULL.  ExecConstraints
- * rejects an unsupplied NOT NULL column even though the write would skip it (its
- * yb_skip_unmodified narrowing would cover this, but only for NOT NULL, and
- * apply passes no ModifyTableState to reach it).  And a partitioned target is
- * taken conservatively, since NOT NULL is judged here from the root while a
- * partition may be stricter; whatever else a leaf needs - its indexes, triggers,
- * check constraints, stored generated columns - YbApplyCanSkipLocalFetch retests
- * against the leaf itself.
- *
- * Keys are compared as replicated values, not stored ones, so this is decided
- * before the lookup; that errs safe, a spurious difference only costing a read.
- */
-static bool
-YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel, bool has_oldtup,
-						  LogicalRepTupleData *oldtup,
-						  LogicalRepTupleData *newtup,
-						  bool any_unsupplied, bool unsupplied_notnull)
-{
-	Bitmapset  *pkey;
-	AttrNumber	minattr;
-	int			col = -1;
-
-	if (!IsYBRelation(rel->localrel))
-		return false;
-
-	/* The slot carries every column, so any write of it is complete. */
-	if (!any_unsupplied)
-		return false;
-
-	if (unsupplied_notnull)
-		return true;
-
-	if (rel->localrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
-		rel->localrel->rd_rel->relispartition)
-		return true;
-
-	if (!has_oldtup)
-		return false;
-
-	pkey = YBGetTablePrimaryKeyBms(rel->localrel);
-	minattr = YBGetFirstLowInvalidAttributeNumber(rel->localrel);
-
-	while ((col = bms_next_member(pkey, col)) >= 0)
-	{
-		AttrNumber	attnum = col + minattr;
-		int			remoteattnum;
-
-		/* ybrowid and other system keys are never sent by the publisher. */
-		if (attnum <= 0)
-			continue;
-
-		remoteattnum = rel->attrmap->attnums[attnum - 1];
-		if (remoteattnum < 0 ||
-			remoteattnum >= oldtup->ncols ||
-			remoteattnum >= newtup->ncols)
-			continue;
-
-		if (oldtup->colstatus[remoteattnum] != newtup->colstatus[remoteattnum])
-			return true;
-
-		if (newtup->colstatus[remoteattnum] == LOGICALREP_COLUMN_TEXT ||
-			newtup->colstatus[remoteattnum] == LOGICALREP_COLUMN_BINARY)
-		{
-			StringInfo	oldval = &oldtup->colvalues[remoteattnum];
-			StringInfo	newval = &newtup->colvalues[remoteattnum];
-
-			if (oldval->len != newval->len ||
-				memcmp(oldval->data, newval->data, newval->len) != 0)
-				return true;
-		}
-	}
-
-	return false;
-}
-
-/*
- * YB: can the apply of an UPDATE/DELETE skip reading the local row and just
- * write, addressing it by the key-derived ybctid?
- *
- * Nothing may need the row's current values: no secondary indexes (old entries
- * are keyed by old values), no triggers needing the old tuple for this
- * operation, no check constraints or stored generated columns (unsent columns).
- * Whether the change itself needs the row is YbReplUpdateNeedsLocalRow's call;
- * DELETE passes false, having no new row to write.
- *
- * Skipping also costs the caller's DEBUG1 missing-row report, since a keyed
- * write cannot tell the row was absent.  DELETE recovers that from its
- * rows-affected count; UPDATE cannot, because apply passes canSetTag false with
- * no RETURNING clause, so YBCExecuteUpdate always batches and never asks for
- * one.  So give up the skip while that report is reachable.
- */
-static bool
-YbApplyCanSkipLocalFetch(Relation localrel, bool needs_local_row,
-						 CmdType operation)
-{
-	if (operation == CMD_UPDATE && message_level_is_interesting(DEBUG1))
-		return false;
-
-	return !needs_local_row &&
-		!YBRelHasSecondaryIndices(localrel) &&
-		!YBRelHasOldRowTriggers(localrel, operation) &&
-		(localrel->rd_att->constr == NULL ||
-		 (localrel->rd_att->constr->num_check == 0 &&
-		  !localrel->rd_att->constr->has_generated_stored));
-}
-
-/*
  * Workhorse for apply_handle_update()
  * relinfo is for the relation we're actually updating in
  * (could be a child partition of edata->targetRelInfo)
@@ -2157,11 +2035,6 @@ apply_handle_update_internal(ApplyExecutionData *edata,
 		oldctx = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 		slot_modify_data(remoteslot, localslot, relmapentry, newtup);
 		MemoryContextSwitchTo(oldctx);
-
-		/* For YB relations, convert virtual slot to heap slot for the executor. */
-		if (IsYBRelation(localrel))
-			remoteslot = CopyVirtualSlotToHeapSlot(estate, remoteslot,
-												   RelationGetDescr(localrel));
 
 		EvalPlanQualSetSlot(&epqstate, remoteslot);
 
@@ -2245,11 +2118,6 @@ apply_handle_delete(StringInfo s)
 	oldctx = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 	slot_store_data(remoteslot, rel, &oldtup);
 	MemoryContextSwitchTo(oldctx);
-
-	/* For YB relations, convert virtual slot to heap slot for the executor. */
-	if (IsYBRelation(rel->localrel))
-		remoteslot = CopyVirtualSlotToHeapSlot(estate, remoteslot,
-											   RelationGetDescr(rel->localrel));
 
 	/* For a partitioned table, apply delete to correct partition. */
 	if (rel->localrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
@@ -4001,6 +3869,13 @@ ApplyWorkerMain(Datum main_arg)
 	/* Attach to slot */
 	logicalrep_worker_attach(worker_slot);
 
+	/*
+	 * YB: the context names the failing change and carries the finish LSN that
+	 * ALTER SUBSCRIPTION ... SKIP needs.  Without it a conflict raised by
+	 * storage, such as a duplicate key, could not be skipped.
+	 */
+	yb_keep_docdb_error_context = true;
+
 	/* Setup signal handling */
 	pqsignal(SIGHUP, SignalHandlerForConfigReload);
 	pqsignal(SIGTERM, die);
@@ -4612,4 +4487,113 @@ yb_reset_origin_progress(RepOriginId originid)
 {
 	replorigin_advance(originid, InvalidXLogRecPtr, InvalidXLogRecPtr,
 					   true /* go backward */ , false /* WAL log */ );
+}
+
+/*
+ * YB: does this UPDATE change the primary key?  Compared as replicated values,
+ * not stored ones, so it can be decided before the lookup; a spurious
+ * difference only costs a read.
+ */
+static bool
+YbReplUpdateChangesKey(LogicalRepRelMapEntry *rel,
+					   LogicalRepTupleData *oldtup,
+					   LogicalRepTupleData *newtup)
+{
+	Bitmapset  *pkey = YBGetTablePrimaryKeyBms(rel->localrel);
+	AttrNumber	minattr = YBGetFirstLowInvalidAttributeNumber(rel->localrel);
+	int			col = -1;
+
+	while ((col = bms_next_member(pkey, col)) >= 0)
+	{
+		int			remoteattnum = rel->attrmap->attnums[col + minattr - 1];
+
+		if (remoteattnum < 0 ||
+			remoteattnum >= oldtup->ncols ||
+			remoteattnum >= newtup->ncols)
+			continue;
+
+		if (oldtup->colstatus[remoteattnum] != newtup->colstatus[remoteattnum])
+			return true;
+
+		if (newtup->colstatus[remoteattnum] == LOGICALREP_COLUMN_TEXT ||
+			newtup->colstatus[remoteattnum] == LOGICALREP_COLUMN_BINARY)
+		{
+			StringInfo	oldval = &oldtup->colvalues[remoteattnum];
+			StringInfo	newval = &newtup->colvalues[remoteattnum];
+
+			if (oldval->len != newval->len ||
+				memcmp(oldval->data, newval->data, newval->len) != 0)
+				return true;
+		}
+	}
+
+	return false;
+}
+
+/*
+ * YB: must this UPDATE read the local row, or can it write blind?
+ *
+ * A key change must.  It is applied as delete plus insert, which written blind
+ * would insert the new row even when the old one is missing here, where PG
+ * skips the change; it also stores the whole slot, NULLs for unsupplied columns
+ * included.
+ *
+ * Otherwise only an unsupplied column can force a read.  YBCExecuteUpdate
+ * stores only updatedCols, so such a column keeps its stored value unread, but
+ * it is NULL in the slot and ExecConstraints rejects that for a NOT NULL column
+ * (its yb_skip_unmodified narrowing needs a ModifyTableState, which apply does
+ * not have).  A partitioned target is taken conservatively, since NOT NULL is
+ * judged here from the root while a partition may be stricter; whatever else a
+ * leaf needs is retested against the leaf by YbApplyCanSkipLocalFetch.
+ */
+static bool
+YbReplUpdateNeedsLocalRow(LogicalRepRelMapEntry *rel, bool has_oldtup,
+						  LogicalRepTupleData *oldtup,
+						  LogicalRepTupleData *newtup,
+						  bool any_unsupplied, bool unsupplied_notnull)
+{
+	if (!IsYBRelation(rel->localrel))
+		return false;
+
+	if (has_oldtup && YbReplUpdateChangesKey(rel, oldtup, newtup))
+		return true;
+
+	/* The slot carries every column, so any write of it is complete. */
+	if (!any_unsupplied)
+		return false;
+
+	return unsupplied_notnull ||
+		rel->localrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+		rel->localrel->rd_rel->relispartition;
+}
+
+/*
+ * YB: can the apply of an UPDATE/DELETE skip reading the local row and just
+ * write, addressing it by the key-derived ybctid?
+ *
+ * Nothing may need the row's current values: no secondary indexes (old entries
+ * are keyed by old values), no triggers needing the old tuple for this
+ * operation, no check constraints or stored generated columns (unsent columns).
+ * Whether the change itself needs the row is YbReplUpdateNeedsLocalRow's call;
+ * DELETE passes false, having no new row to write.
+ *
+ * Skipping also costs the caller's DEBUG1 missing-row report, since a keyed
+ * write cannot tell the row was absent.  DELETE recovers that from its
+ * rows-affected count; UPDATE cannot, because apply passes canSetTag false with
+ * no RETURNING clause, so YBCExecuteUpdate always batches and never asks for
+ * one.  So give up the skip while that report is reachable.
+ */
+static bool
+YbApplyCanSkipLocalFetch(Relation localrel, bool needs_local_row,
+						 CmdType operation)
+{
+	if (operation == CMD_UPDATE && message_level_is_interesting(DEBUG1))
+		return false;
+
+	return !needs_local_row &&
+		!YBRelHasSecondaryIndices(localrel) &&
+		!YBRelHasOldRowTriggers(localrel, operation) &&
+		(localrel->rd_att->constr == NULL ||
+		 (localrel->rd_att->constr->num_check == 0 &&
+		  !localrel->rd_att->constr->has_generated_stored));
 }

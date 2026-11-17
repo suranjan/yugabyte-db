@@ -1256,12 +1256,6 @@ void
 heap_rescan(TableScanDesc sscan, ScanKey key, bool set_params,
 			bool allow_strat, bool allow_sync, bool allow_pagemode)
 {
-	if (IsYBRelation(sscan->rs_rd))
-	{
-		ybc_heap_rescan(sscan, key);
-		return;
-	}
-
 	HeapScanDesc scan = (HeapScanDesc) sscan;
 
 	if (set_params)
