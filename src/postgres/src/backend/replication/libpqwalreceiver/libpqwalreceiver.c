@@ -28,7 +28,6 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "pqexpbuffer.h"
-#include "replication/slot.h"
 #include "replication/walreceiver.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
@@ -37,6 +36,7 @@
 
 /* YB includes */
 #include "pg_yb_utils.h"
+#include "replication/slot.h"
 
 PG_MODULE_MAGIC;
 
