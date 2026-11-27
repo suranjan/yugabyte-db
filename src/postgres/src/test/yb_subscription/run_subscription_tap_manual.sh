@@ -49,7 +49,7 @@ if [ "${1:-}" = "verify" ]; then
     ORDER BY c.relname;" 2>/dev/null || true
   echo ""
   echo "=== 2. Verify subscriber (YugabyteDB) ==="
-  "$YB_YSQLSH_PATH" "$YB_CONN" -c "SELECT 1 AS subscriber_ok;" || { echo "FAIL: cannot connect to subscriber. Run: yugabyted status  # then set YB_SUBSCRIBER_CONNSTR with that host (e.g. host=10.157.0.4 port=5433 user=yugabyte dbname=yugabyte)"; exit 1; }
+  "$YB_YSQLSH_PATH" "$YB_CONN" -c "SELECT 1 AS subscriber_ok;" || { echo "FAIL: cannot connect to subscriber. Run: yugabyted status  # then set YB_SUBSCRIBER_CONNSTR with that host (e.g. host=192.0.2.1 port=5433 user=yugabyte dbname=yugabyte)"; exit 1; }
   echo "Subscriber OK."
   SUB_OK=$("$YB_YSQLSH_PATH" "$YB_CONN" -t -A -c "SELECT current_setting('yb_enable_pg_subscription', true);" 2>/dev/null || echo "off")
   if [ "$SUB_OK" != "on" ]; then

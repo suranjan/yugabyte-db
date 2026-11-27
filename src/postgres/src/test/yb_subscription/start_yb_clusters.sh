@@ -21,8 +21,8 @@ esac
 
 YB_SRC="${YB_SRC_ROOT:-$(cd "$(dirname "$0")/../../../../.." && pwd)}"
 YUGABYTED="$YB_SRC/bin/yugabyted"
-PUB_DIR="${PUB_BASE_DIR:-/tmp/claude-1094/ybpub}"
-SUB_DIR="${SUB_BASE_DIR:-/tmp/claude-1094/ybsub2}"
+PUB_DIR="${PUB_BASE_DIR:-/tmp/yb_subscription_tap/ybpub}"
+SUB_DIR="${SUB_BASE_DIR:-/tmp/yb_subscription_tap/ybsub}"
 PUB_ADDR=127.0.0.1
 SUB_ADDR=127.0.0.2
 
