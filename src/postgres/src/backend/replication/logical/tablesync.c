@@ -122,6 +122,7 @@
 
 /* YB includes */
 #include "pg_yb_utils.h"
+#include "replication/yb_apply_progress.h"
 
 typedef enum
 {
@@ -510,6 +511,10 @@ process_syncing_tables_for_apply(XLogRecPtr current_lsn)
 												  originname,
 												  sizeof(originname));
 				replorigin_drop_by_name(originname, true, false);
+
+				/* YB: the tablesync worker's progress row goes with its origin. */
+				if (IsYugaByteEnabled())
+					YbDeleteApplyProgress(MyLogicalRepWorker->subid, rstate->relid);
 
 				/*
 				 * Update the state to READY only after the origin cleanup.

@@ -50,6 +50,7 @@
 
 /* YB includes */
 #include "pg_yb_utils.h"
+#include "replication/yb_apply_progress.h"
 
 /*
  * Options that can be specified by the user in CREATE/ALTER SUBSCRIPTION
@@ -940,6 +941,10 @@ AlterSubscription_refresh(Subscription *sub, bool copy_data,
 					ReplicationOriginNameForTablesync(sub->oid, relid, originname,
 													  sizeof(originname));
 					replorigin_drop_by_name(originname, true, false);
+
+					/* YB: and its apply progress row. */
+					if (IsYugaByteEnabled())
+						YbDeleteApplyProgress(sub->oid, relid);
 				}
 
 				ereport(DEBUG1,
@@ -1537,6 +1542,10 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 		ReplicationOriginNameForTablesync(subid, relid, originname,
 										  sizeof(originname));
 		replorigin_drop_by_name(originname, true, false);
+
+		/* YB: and its apply progress row. */
+		if (IsYugaByteEnabled())
+			YbDeleteApplyProgress(subid, relid);
 	}
 
 	/* Clean up dependencies */
@@ -1548,6 +1557,10 @@ DropSubscription(DropSubscriptionStmt *stmt, bool isTopLevel)
 	/* Remove the origin tracking if exists. */
 	snprintf(originname, sizeof(originname), "pg_%u", subid);
 	replorigin_drop_by_name(originname, true, false);
+
+	/* YB: and the apply worker's progress row; relid 0 is the apply worker. */
+	if (IsYugaByteEnabled())
+		YbDeleteApplyProgress(subid, InvalidOid);
 
 	/*
 	 * Tell the cumulative stats system that the subscription is getting

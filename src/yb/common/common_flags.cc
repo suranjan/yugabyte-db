@@ -447,6 +447,10 @@ DEFINE_RUNTIME_int32(db_history_retention_pin_min_txn_age_sec, 300,
     "snapshot too old errors.");
 
 DEFINE_RUNTIME_PG_FLAG(bool, yb_enable_listen_notify, false, "Enable YSQL LISTEN/NOTIFY.");
+// A gflag as well as the GUC so the master can see it: it creates the table apply workers record
+// their progress in (yb_system.pg_yb_subscription_progress).
+DEFINE_NON_RUNTIME_PG_FLAG(bool, yb_enable_pg_subscription, false,
+    "Enable CREATE/ALTER/DROP SUBSCRIPTION.");
 DEFINE_RUNTIME_PG_FLAG(int32, yb_test_notify_queue_max_pages, 0,
     "When positive, artificially limits the NOTIFY queue to this many pages for testing.");
 DEFINE_RUNTIME_AUTO_bool(ysql_enable_auto_analyze_infra, kLocalPersisted, false, true,
